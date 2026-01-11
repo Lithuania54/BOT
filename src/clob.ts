@@ -69,13 +69,6 @@ export function roundPriceToTick(price: number, tickSize: string, side: "BUY" | 
   return Number(value.toFixed(countDecimals(tickSize)));
 }
 
-export function roundDownToStep(value: number, step: string): number {
-  const stepNum = toNumber(step);
-  if (stepNum <= 0) return value;
-  const rounded = Math.floor(value / stepNum) * stepNum;
-  return Number(rounded.toFixed(countDecimals(step)));
-}
-
 export async function getExecutablePrice(client: ClobClient, tokenId: string, side: "BUY" | "SELL"): Promise<number> {
   const price = await client.getPrice(tokenId, side);
   return toNumber(price);

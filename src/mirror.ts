@@ -3,7 +3,7 @@ import { Config, MirrorResult, Trade } from "./types";
 import { StateStore } from "./state";
 import { fetchPositions } from "./api/dataApi";
 import { getClobTokenIdsForCondition } from "./api/gamma";
-import { getExecutablePrice, getOrderbookMeta, roundDownToStep, roundPriceToTick } from "./clob";
+import { getExecutablePrice, getOrderbookMeta, roundPriceToTick } from "./clob";
 import { logger } from "./logger";
 
 function todayKey(): string {
@@ -12,6 +12,17 @@ function todayKey(): string {
   const mm = String(now.getUTCMonth() + 1).padStart(2, "0");
   const dd = String(now.getUTCDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+function countDecimals(value: string): number {
+  const idx = value.indexOf(".");
+  return idx === -1 ? 0 : value.length - idx - 1;
+}
+
+function roundSize(value: number, precision: number): number {
+  if (precision <= 0) return Math.floor(value);
+  const factor = Math.pow(10, precision);
+  return Math.floor(value * factor) / factor;
 }
 
 export async function mirrorTrade(
@@ -39,7 +50,14 @@ export async function mirrorTrade(
     return { status: "skipped", reason: "invalid trade notional" };
   }
 
+  if (weight <= 0) {
+    return { status: "skipped", reason: "non-positive weight" };
+  }
+
   const desiredNotional = Math.min(tradeNotional * config.copyRatio * weight, config.maxUsdcPerTrade);
+  if (desiredNotional <= 0) {
+    return { status: "skipped", reason: "non-positive desired notional" };
+  }
   if (config.maxDailyUsdc !== undefined) {
     const dateKey = todayKey();
     const spent = state.getDailyNotional(dateKey);
@@ -60,8 +78,10 @@ export async function mirrorTrade(
     shares = Math.min(shares, availableShares);
   }
 
-  shares = roundDownToStep(shares, meta.minOrderSize);
-  if (shares <= 0 || shares < Number(meta.minOrderSize)) {
+  const minOrderSize = Number(meta.minOrderSize);
+  const sizePrecision = countDecimals(meta.minOrderSize);
+  shares = roundSize(shares, sizePrecision);
+  if (shares <= 0 || shares < minOrderSize) {
     return { status: "skipped", reason: "size below min" };
   }
 
