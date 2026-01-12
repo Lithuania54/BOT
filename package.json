@@ -9,9 +9,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "@polymarket/builder-signing-sdk": "^0.0.8",
     "@polymarket/clob-client": "^4.22.8",
     "better-sqlite3": "^11.5.0",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "ethers": "^5.7.2",
+    "viem": "^2.44.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

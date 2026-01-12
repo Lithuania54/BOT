@@ -4,6 +4,7 @@ import { resolveTargetToProxyWallet } from "./api/gamma";
 import { fetchTrades, normalizeTrade } from "./api/dataApi";
 import { initClobClients } from "./clob";
 import { buildTradeKey, mirrorTrade } from "./mirror";
+import { startAutoRedeemLoop } from "./redeem";
 import { StateStore } from "./state";
 import { computeScores } from "./scoring";
 import { selectLeaders } from "./selector";
@@ -81,7 +82,19 @@ async function run() {
     process.exit(1);
   }
 
-  const { publicClient, tradingClient } = await initClobClients(config);
+  const { publicClient, tradingClient: initialTradingClient, startTradingClientRetry } = await initClobClients(config);
+  let tradingClient = initialTradingClient;
+  if (startTradingClientRetry) {
+    startTradingClientRetry((client) => {
+      tradingClient = client;
+    });
+  }
+
+  startAutoRedeemLoop({
+    config,
+    state,
+    publicClient,
+  });
 
   const resolvedTargets = await resolveTargets(config.targets, state);
   let selection: LeaderSelection = { mode: config.followMode, leaders: [], reason: "not evaluated" };

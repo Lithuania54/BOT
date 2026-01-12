@@ -5,11 +5,13 @@ import { StateStore } from "./state";
 import { logger } from "./logger";
 
 const META_TTL_MS = 5 * 60 * 1000;
-const API_KEY_RETRY_DELAYS_MS = [1000, 2000, 4000];
+const API_KEY_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
+const API_KEY_BACKGROUND_RETRY_MS = 2 * 60 * 1000;
 
 export async function initClobClients(config: Config): Promise<{
   publicClient: ClobClient;
   tradingClient?: ClobClient;
+  startTradingClientRetry?: (onReady: (client: ClobClient) => void) => void;
 }> {
   const publicClient = new ClobClient(config.clobHost, config.chainId);
 
@@ -19,16 +21,58 @@ export async function initClobClients(config: Config): Promise<{
 
   const signer = new Wallet(config.privateKey as string);
   const creds = await createOrDeriveApiKeyWithRetry(config, signer);
-  const tradingClient = new ClobClient(
-    config.clobHost,
-    config.chainId,
-    signer,
-    creds,
-    config.signatureType as any,
-    config.funderAddress
-  );
+  let tradingClient: ClobClient | undefined;
+  if (creds) {
+    tradingClient = new ClobClient(
+      config.clobHost,
+      config.chainId,
+      signer,
+      creds,
+      config.signatureType as any,
+      config.funderAddress
+    );
+  } else {
+    logger.error("API key creation failed; bot will run in observe-only mode and retry in background");
+    logger.warn("If this error is intermittent, ensure system time is synced.");
+  }
 
-  return { publicClient, tradingClient };
+  const startTradingClientRetry = tradingClient
+    ? undefined
+    : (onReady: (client: ClobClient) => void) => {
+        let running = false;
+        const attempt = async () => {
+          if (running) return;
+          running = true;
+          try {
+            const nextCreds = await createOrDeriveApiKeyWithRetry(config, signer);
+            if (nextCreds) {
+              const nextClient = new ClobClient(
+                config.clobHost,
+                config.chainId,
+                signer,
+                nextCreds,
+                config.signatureType as any,
+                config.funderAddress
+              );
+              onReady(nextClient);
+              logger.info("API key creation recovered; trading client authenticated");
+              clearInterval(timer);
+            }
+          } finally {
+            running = false;
+          }
+        };
+        const timer = setInterval(() => {
+          attempt().catch((err) =>
+            logger.error("API key background retry failed", { error: extractErrorInfo(err).message })
+          );
+        }, API_KEY_BACKGROUND_RETRY_MS);
+        attempt().catch((err) =>
+          logger.error("API key background retry failed", { error: extractErrorInfo(err).message })
+        );
+      };
+
+  return { publicClient, tradingClient, startTradingClientRetry };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -38,7 +82,6 @@ function sleep(ms: number): Promise<void> {
 async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
   const client = new ClobClient(config.clobHost, config.chainId, signer);
   let lastError: unknown;
-
   for (let attempt = 0; attempt < API_KEY_RETRY_DELAYS_MS.length + 1; attempt += 1) {
     try {
       return await client.createOrDeriveApiKey();
@@ -60,7 +103,10 @@ async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
     }
   }
 
-  throw lastError;
+  logger.error("createOrDeriveApiKey failed after retries", {
+    error: extractErrorInfo(lastError).message,
+  });
+  return null;
 }
 
 function toNumber(value: unknown): number {

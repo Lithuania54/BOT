@@ -80,6 +80,15 @@ export function loadConfig(): Config {
     openPnlPenaltyFactor: parseNumber("OPEN_PNL_PENALTY_FACTOR", 0.25),
     orderTtlSeconds: parseNumber("ORDER_TTL_SECONDS", 60),
     expirationSafetySeconds: parseNumber("EXPIRATION_SAFETY_SECONDS", 60),
+    autoRedeemEnabled: parseBoolean("AUTO_REDEEM_ENABLED", false),
+    redeemPollMs: parseNumber("REDEEM_POLL_MS", 300000),
+    redeemCooldownMs: parseNumber("REDEEM_COOLDOWN_MS", 3600000),
+    relayerEnabled: parseBoolean("RELAYER_ENABLED", false),
+    relayerUrl: process.env.POLYMARKET_RELAYER_URL || "https://relayer-v2.polymarket.com/",
+    rpcUrl: process.env.RPC_URL,
+    builderApiKey: process.env.BUILDER_API_KEY,
+    builderSecret: process.env.BUILDER_SECRET,
+    builderPassphrase: process.env.BUILDER_PASSPHRASE,
   };
 
   if (!config.dryRun) {
