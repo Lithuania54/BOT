@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import { Config, FollowMode } from "./types";
+import { logger } from "./logger";
 
 dotenv.config();
 
@@ -37,6 +38,26 @@ function requireString(name: string): string {
   const raw = process.env[name];
   if (!raw) throw new Error(`Missing ${name}`);
   return raw;
+}
+
+function parseRpcUrl(): string | undefined {
+  const raw = process.env.RPC_URL;
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || /\s/.test(trimmed)) {
+    logger.error("RPC_URL is invalid (contains whitespace). Auto-redeem will be disabled.", { rpcUrl: raw });
+    return undefined;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (!parsed.protocol.startsWith("http")) {
+      throw new Error("Invalid protocol");
+    }
+    return trimmed;
+  } catch {
+    logger.error("RPC_URL is invalid (not a URL). Auto-redeem will be disabled.", { rpcUrl: raw });
+    return undefined;
+  }
 }
 
 export function loadConfig(): Config {
@@ -80,15 +101,11 @@ export function loadConfig(): Config {
     openPnlPenaltyFactor: parseNumber("OPEN_PNL_PENALTY_FACTOR", 0.25),
     orderTtlSeconds: parseNumber("ORDER_TTL_SECONDS", 60),
     expirationSafetySeconds: parseNumber("EXPIRATION_SAFETY_SECONDS", 60),
+    marketEndSafetySeconds: parseNumber("MARKET_END_SAFETY_SECONDS", 120),
     autoRedeemEnabled: parseBoolean("AUTO_REDEEM_ENABLED", false),
     redeemPollMs: parseNumber("REDEEM_POLL_MS", 300000),
     redeemCooldownMs: parseNumber("REDEEM_COOLDOWN_MS", 3600000),
-    relayerEnabled: parseBoolean("RELAYER_ENABLED", false),
-    relayerUrl: process.env.POLYMARKET_RELAYER_URL || "https://relayer-v2.polymarket.com/",
-    rpcUrl: process.env.RPC_URL,
-    builderApiKey: process.env.BUILDER_API_KEY,
-    builderSecret: process.env.BUILDER_SECRET,
-    builderPassphrase: process.env.BUILDER_PASSPHRASE,
+    rpcUrl: parseRpcUrl(),
   };
 
   if (!config.dryRun) {

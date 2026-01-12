@@ -91,3 +91,14 @@ export async function getClobTokenIdsForCondition(
   state.setConditionTokenIds(conditionId, tokenIds);
   return tokenIds;
 }
+
+export async function getMarketByConditionId(conditionId: string): Promise<any | null> {
+  const url = `${GAMMA_BASE}/markets?${new URLSearchParams({
+    condition_ids: conditionId,
+    limit: "1",
+    offset: "0",
+  }).toString()}`;
+  const data = await fetchJson<any>(url);
+  const markets = Array.isArray(data) ? data : data?.markets || data?.data || [];
+  return markets[0] || null;
+}

@@ -2,7 +2,7 @@ import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
 import { Config, MirrorResult, Trade } from "./types";
 import { StateStore } from "./state";
 import { fetchPositions } from "./api/dataApi";
-import { getClobTokenIdsForCondition } from "./api/gamma";
+import { getClobTokenIdsForCondition, getMarketByConditionId } from "./api/gamma";
 import {
   computeGtdExpirationSeconds,
   getExecutablePriceFromBook,
@@ -32,6 +32,40 @@ function roundSize(value: number, precision: number): number {
   if (precision <= 0) return Math.floor(value);
   const factor = Math.pow(10, precision);
   return Math.floor(value * factor) / factor;
+}
+
+function parseMarketEndMs(market: any): number | null {
+  if (!market) return null;
+  const candidates = [
+    market?.end_date,
+    market?.endDate,
+    market?.close_time,
+    market?.closeTime,
+    market?.close_timestamp,
+    market?.closeTimestamp,
+    market?.resolution_time,
+    market?.resolutionTime,
+    market?.resolve_time,
+    market?.resolveTime,
+    market?.end_time,
+    market?.endTime,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate === undefined || candidate === null) continue;
+    if (typeof candidate === "number") {
+      return candidate < 1e12 ? candidate * 1000 : candidate;
+    }
+    if (typeof candidate === "string") {
+      const numeric = Number(candidate);
+      if (!Number.isNaN(numeric)) {
+        return numeric < 1e12 ? numeric * 1000 : numeric;
+      }
+      const parsed = Date.parse(candidate);
+      if (!Number.isNaN(parsed)) return parsed;
+    }
+  }
+  return null;
 }
 
 function extractErrorInfo(err: unknown): { message: string; status?: number | string } {
@@ -163,6 +197,26 @@ export async function mirrorTrade(
   const tokenValidation = validateTokenId(tokenId, trade.conditionId, trade.outcomeIndex, lookupSummary);
   if (!tokenValidation.ok) {
     return { status: "skipped", reason: tokenValidation.reason || "invalid tokenId" };
+  }
+
+  if (trade.side === "BUY") {
+    try {
+      const market = await getMarketByConditionId(trade.conditionId);
+      const endMs = parseMarketEndMs(market);
+      if (endMs) {
+        const nowMs = Date.now();
+        const safetyMs = config.marketEndSafetySeconds * 1000;
+        if (nowMs >= endMs - safetyMs) {
+          return { status: "skipped", reason: "market expired/too close to end" };
+        }
+        const ttlMs = config.orderTtlSeconds * 1000;
+        if (nowMs + ttlMs >= endMs - safetyMs) {
+          return { status: "skipped", reason: "order TTL crosses market end" };
+        }
+      }
+    } catch (err) {
+      logger.warn("market end lookup failed", { conditionId: trade.conditionId, error: (err as Error).message });
+    }
   }
 
   const bookResult = await getExecutablePriceFromBook(publicClient, tokenId, trade.side as Side);

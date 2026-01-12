@@ -28,15 +28,11 @@ export interface Config {
   openPnlPenaltyFactor: number;
   orderTtlSeconds: number;
   expirationSafetySeconds: number;
+  marketEndSafetySeconds: number;
   autoRedeemEnabled: boolean;
   redeemPollMs: number;
   redeemCooldownMs: number;
-  relayerEnabled: boolean;
-  relayerUrl: string;
   rpcUrl?: string;
-  builderApiKey?: string;
-  builderSecret?: string;
-  builderPassphrase?: string;
 }
 
 export interface ResolvedTarget {

@@ -1,9 +1,7 @@
 import { ClobClient } from "@polymarket/clob-client";
-import { RelayClient, RelayerTxType, Transaction } from "@polymarket/builder-relayer-client";
-import { BuilderConfig } from "@polymarket/builder-signing-sdk";
 import { JsonRpcProvider } from "@ethersproject/providers";
 import { Wallet } from "@ethersproject/wallet";
-import { constants, utils } from "ethers";
+import { Contract, constants, utils } from "ethers";
 import { fetchPositions } from "./api/dataApi";
 import { Config } from "./types";
 import { StateStore } from "./state";
@@ -11,6 +9,14 @@ import { logger } from "./logger";
 
 const CTF_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
 const USDCe_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+const SAFE_ABI = [
+  "function getThreshold() view returns (uint256)",
+  "function getOwners() view returns (address[])",
+  "function nonce() view returns (uint256)",
+  "function getTransactionHash(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce) view returns (bytes32)",
+  "function execTransaction(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,bytes signatures) returns (bool)",
+];
 
 const redeemInterface = new utils.Interface([
   "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
@@ -42,32 +48,8 @@ function extractErrorInfo(err: unknown): { message: string; status?: number | st
   return { message, status };
 }
 
-function canAutoRedeem(config: Config): boolean {
-  return Boolean(
-    config.relayerEnabled &&
-      config.builderApiKey &&
-      config.builderSecret &&
-      config.builderPassphrase &&
-      config.privateKey &&
-      config.rpcUrl
-  );
-}
-
-function createRelayClient(config: Config): RelayClient | null {
-  if (!canAutoRedeem(config)) return null;
-
-  const builderConfig = new BuilderConfig({
-    localBuilderCreds: {
-      key: config.builderApiKey as string,
-      secret: config.builderSecret as string,
-      passphrase: config.builderPassphrase as string,
-    },
-  });
-
-  const provider = new JsonRpcProvider(config.rpcUrl as string);
-  const signer = new Wallet(config.privateKey as string, provider);
-
-  return new RelayClient(config.relayerUrl, config.chainId, signer, builderConfig, RelayerTxType.SAFE);
+function isRedeemConfigReady(config: Config): boolean {
+  return Boolean(config.privateKey && config.rpcUrl && config.funderAddress);
 }
 
 export function startAutoRedeemLoop(deps: {
@@ -82,10 +64,55 @@ export function startAutoRedeemLoop(deps: {
     return () => undefined;
   }
 
+  if (!isRedeemConfigReady(config)) {
+    logger.error("auto-redeem disabled: PRIVATE_KEY, RPC_URL, and FUNDER_ADDRESS are required", {
+      hasPrivateKey: Boolean(config.privateKey),
+      hasRpcUrl: Boolean(config.rpcUrl),
+      hasFunderAddress: Boolean(config.funderAddress),
+    });
+    return () => undefined;
+  }
+
   logger.info("auto-redeem loop started", { pollMs: config.redeemPollMs });
 
   const lastAttemptMs = new Map<string, number>();
-  let relayClient: RelayClient | null = null;
+  const provider = new JsonRpcProvider(config.rpcUrl as string);
+  const signer = new Wallet(config.privateKey as string, provider);
+  const safeAddress = config.funderAddress as string;
+  const safeContract = new Contract(safeAddress, SAFE_ABI, signer);
+  let safeChecked = false;
+  let safeReady = false;
+  let safeOwners: string[] = [];
+  let safeThreshold = 0;
+
+  const ensureSafeReady = async () => {
+    if (safeChecked) return safeReady;
+    safeChecked = true;
+    try {
+      const [owners, threshold] = await Promise.all([safeContract.getOwners(), safeContract.getThreshold()]);
+      safeOwners = owners.map((owner: string) => owner.toLowerCase());
+      safeThreshold = Number(threshold);
+      const signerAddress = (await signer.getAddress()).toLowerCase();
+      const isOwner = safeOwners.includes(signerAddress);
+      if (!isOwner || safeThreshold !== 1) {
+        logger.error("safe configuration not supported", {
+          safe: safeAddress,
+          threshold: safeThreshold,
+          owners: safeOwners,
+          signer: signerAddress,
+        });
+        safeReady = false;
+        return false;
+      }
+      safeReady = true;
+      return true;
+    } catch (err) {
+      const info = extractErrorInfo(err);
+      logger.error("failed to read safe configuration", { safe: safeAddress, error: info.message, status: info.status });
+      safeReady = false;
+      return false;
+    }
+  };
 
   const shouldAttempt = (conditionId: string, now: number) => {
     const last = lastAttemptMs.get(conditionId) || 0;
@@ -96,13 +123,66 @@ export function startAutoRedeemLoop(deps: {
     lastAttemptMs.set(conditionId, now);
   };
 
+  const executeRedeem = async (conditionId: string, market: any) => {
+    const indexSets = buildIndexSets(market);
+    const data = redeemInterface.encodeFunctionData("redeemPositions", [
+      USDCe_ADDRESS,
+      constants.HashZero,
+      conditionId,
+      indexSets,
+    ]);
+
+    const nonce = await safeContract.nonce();
+    const operation = 0;
+    const safeTxGas = 0;
+    const baseGas = 0;
+    const gasPrice = 0;
+    const gasToken = constants.AddressZero;
+    const refundReceiver = constants.AddressZero;
+
+    const safeTxHash = await safeContract.getTransactionHash(
+      CTF_ADDRESS,
+      0,
+      data,
+      operation,
+      safeTxGas,
+      baseGas,
+      gasPrice,
+      gasToken,
+      refundReceiver,
+      nonce
+    );
+
+    const signature = signer._signingKey().signDigest(safeTxHash);
+    const signatures = utils.joinSignature(signature);
+
+    const tx = await safeContract.execTransaction(
+      CTF_ADDRESS,
+      0,
+      data,
+      operation,
+      safeTxGas,
+      baseGas,
+      gasPrice,
+      gasToken,
+      refundReceiver,
+      signatures
+    );
+
+    const receipt = await tx.wait();
+    logger.info("redeem success", {
+      conditionId,
+      transactionHash: receipt?.transactionHash,
+      blockNumber: receipt?.blockNumber,
+    });
+  };
+
   const loop = async () => {
     try {
-      if (!relayClient && canAutoRedeem(config)) {
-        relayClient = createRelayClient(config);
-      }
+      const ready = await ensureSafeReady();
+      if (!ready) return;
 
-      const positions = await fetchPositions(config.myUserAddress);
+      const positions = await fetchPositions(config.funderAddress as string);
       const conditionIds = new Set<string>();
       for (const position of positions) {
         if (position.size > 0 && position.conditionId) {
@@ -121,39 +201,7 @@ export function startAutoRedeemLoop(deps: {
 
           logger.info("market resolved", { conditionId });
 
-          if (!relayClient) {
-            logger.warn("auto-redeem skipped", {
-              conditionId,
-              reason: "missing relayer credentials",
-              message:
-                "Market resolved and positions appear redeemable, but auto-redeem requires builder relayer credentials; redeem manually in UI.",
-            });
-            continue;
-          }
-
-          const indexSets = buildIndexSets(market);
-          const data = redeemInterface.encodeFunctionData("redeemPositions", [
-            USDCe_ADDRESS,
-            constants.HashZero,
-            conditionId,
-            indexSets,
-          ]);
-
-          const tx: Transaction = {
-            to: CTF_ADDRESS,
-            data,
-            value: "0",
-          };
-
-          const resp = await relayClient.execute([tx], "Redeem winning tokens");
-          const result = await resp.wait();
-
-          logger.info("redeem success", {
-            conditionId,
-            transactionId: resp.transactionID,
-            transactionHash: resp.transactionHash || resp.hash || result?.transactionHash,
-            state: result?.state || resp.state,
-          });
+          await executeRedeem(conditionId, market);
         } catch (err) {
           const info = extractErrorInfo(err);
           logger.warn("redeem failed", { conditionId, error: info.message, status: info.status });
