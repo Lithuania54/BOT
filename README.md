@@ -53,6 +53,8 @@ All environment variables are parsed in `src/config.ts`.
 - `FUNDER_ADDRESS` required when `DRY_RUN=false`
 - `MAX_DAILY_USDC` optional daily spend cap
 - `OPEN_PNL_PENALTY_FACTOR` penalty multiplier for negative open PnL
+- `ORDER_TTL_SECONDS` desired GTD order TTL in seconds (default 60)
+- `EXPIRATION_SAFETY_SECONDS` expiration safety buffer in seconds (default 60)
 - `LOG_LEVEL` optional (`debug`, `info`, `warn`, `error`)
 
 ## How It Works

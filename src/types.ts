@@ -26,6 +26,8 @@ export interface Config {
   funderAddress?: string;
   maxDailyUsdc?: number;
   openPnlPenaltyFactor: number;
+  orderTtlSeconds: number;
+  expirationSafetySeconds: number;
 }
 
 export interface ResolvedTarget {
@@ -95,10 +97,12 @@ export interface OrderBookMeta {
 }
 
 export interface MirrorResult {
-  status: "placed" | "skipped" | "dry_run";
+  status: "placed" | "skipped" | "dry_run" | "failed";
   reason: string;
   orderId?: string;
   notional?: number;
   size?: number;
   limitPrice?: number;
+  errorMessage?: string;
+  errorStatus?: number | string;
 }

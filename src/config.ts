@@ -78,6 +78,8 @@ export function loadConfig(): Config {
     funderAddress: process.env.FUNDER_ADDRESS,
     maxDailyUsdc: process.env.MAX_DAILY_USDC ? parseNumber("MAX_DAILY_USDC") : undefined,
     openPnlPenaltyFactor: parseNumber("OPEN_PNL_PENALTY_FACTOR", 0.25),
+    orderTtlSeconds: parseNumber("ORDER_TTL_SECONDS", 60),
+    expirationSafetySeconds: parseNumber("EXPIRATION_SAFETY_SECONDS", 60),
   };
 
   if (!config.dryRun) {

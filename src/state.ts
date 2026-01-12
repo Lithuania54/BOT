@@ -2,6 +2,53 @@ import Database from "better-sqlite3";
 import path from "path";
 import { OrderBookMeta, ResolvedTarget, TraderScore } from "./types";
 
+interface TargetRow {
+  target: string;
+  displayName: string;
+  proxyWallet: string;
+}
+
+interface ConditionRow {
+  conditionId: string;
+  tokenIds: string;
+}
+
+interface TokenMetaRow {
+  tokenId: string;
+  tickSize: string;
+  minOrderSize: string;
+  negRisk: number;
+  updatedAt: number;
+}
+
+interface LastSeenRow {
+  proxyWallet: string;
+  lastSeenMs: number;
+}
+
+interface SelectorStateRow {
+  currentLeader: string | null;
+  sinceMs: number | null;
+}
+
+interface LeadersSnapshotRow {
+  leadersJson: string | null;
+  updatedAt: number | null;
+}
+
+interface CooldownRow {
+  lastSwitchedAwayMs: number;
+}
+
+interface DailyNotionalRow {
+  notional: number;
+}
+
+interface LastCopiedRow {
+  tradeKey: string | null;
+  timestampMs: number | null;
+}
+
 export class StateStore {
   private db: InstanceType<typeof Database>;
   private targetCache = new Map<string, ResolvedTarget>();
@@ -83,7 +130,9 @@ export class StateStore {
   }
 
   private loadCaches() {
-    const targetRows = this.db.prepare("SELECT target, displayName, proxyWallet FROM targets").all();
+    const targetRows = this.db
+      .prepare("SELECT target, displayName, proxyWallet FROM targets")
+      .all() as TargetRow[];
     for (const row of targetRows) {
       this.targetCache.set(row.target, {
         target: row.target,
@@ -92,7 +141,9 @@ export class StateStore {
       });
     }
 
-    const conditionRows = this.db.prepare("SELECT conditionId, tokenIds FROM condition_tokens").all();
+    const conditionRows = this.db
+      .prepare("SELECT conditionId, tokenIds FROM condition_tokens")
+      .all() as ConditionRow[];
     for (const row of conditionRows) {
       try {
         const tokenIds = JSON.parse(row.tokenIds);
@@ -102,7 +153,9 @@ export class StateStore {
       }
     }
 
-    const tokenMetaRows = this.db.prepare("SELECT tokenId, tickSize, minOrderSize, negRisk, updatedAt FROM token_meta").all();
+    const tokenMetaRows = this.db
+      .prepare("SELECT tokenId, tickSize, minOrderSize, negRisk, updatedAt FROM token_meta")
+      .all() as TokenMetaRow[];
     for (const row of tokenMetaRows) {
       this.tokenMetaCache.set(row.tokenId, {
         tokenId: row.tokenId,
@@ -113,7 +166,9 @@ export class StateStore {
       });
     }
 
-    const lastSeenRows = this.db.prepare("SELECT proxyWallet, lastSeenMs FROM last_seen").all();
+    const lastSeenRows = this.db
+      .prepare("SELECT proxyWallet, lastSeenMs FROM last_seen")
+      .all() as LastSeenRow[];
     for (const row of lastSeenRows) {
       this.lastSeenCache.set(row.proxyWallet, row.lastSeenMs);
     }
@@ -167,7 +222,9 @@ export class StateStore {
 
   hasProcessed(tradeKey: string): boolean {
     if (this.processedCache.has(tradeKey)) return true;
-    const row = this.db.prepare("SELECT tradeKey FROM processed_trades WHERE tradeKey = ?").get(tradeKey);
+    const row = this.db
+      .prepare("SELECT tradeKey FROM processed_trades WHERE tradeKey = ?")
+      .get(tradeKey) as { tradeKey: string } | undefined;
     if (row) this.processedCache.add(tradeKey);
     return Boolean(row);
   }
@@ -197,7 +254,9 @@ export class StateStore {
   }
 
   getLeaderState(): { currentLeader?: string; sinceMs?: number } {
-    const row = this.db.prepare("SELECT currentLeader, sinceMs FROM leader_state WHERE id = 1").get();
+    const row = this.db
+      .prepare("SELECT currentLeader, sinceMs FROM leader_state WHERE id = 1")
+      .get() as SelectorStateRow | undefined;
     if (!row) return {};
     return { currentLeader: row.currentLeader || undefined, sinceMs: row.sinceMs || undefined };
   }
@@ -209,7 +268,9 @@ export class StateStore {
   }
 
   getTopKState(): { leaders: string[]; updatedAtMs?: number } {
-    const row = this.db.prepare("SELECT leadersJson, updatedAt FROM topk_state WHERE id = 1").get();
+    const row = this.db
+      .prepare("SELECT leadersJson, updatedAt FROM topk_state WHERE id = 1")
+      .get() as LeadersSnapshotRow | undefined;
     if (!row?.leadersJson) return { leaders: [] };
     try {
       const leaders = JSON.parse(row.leadersJson);
@@ -232,12 +293,16 @@ export class StateStore {
   }
 
   getLastSwitchedAway(proxyWallet: string): number {
-    const row = this.db.prepare("SELECT lastSwitchedAwayMs FROM switches WHERE proxyWallet = ?").get(proxyWallet);
+    const row = this.db
+      .prepare("SELECT lastSwitchedAwayMs FROM switches WHERE proxyWallet = ?")
+      .get(proxyWallet) as CooldownRow | undefined;
     return row?.lastSwitchedAwayMs || 0;
   }
 
   getDailyNotional(date: string): number {
-    const row = this.db.prepare("SELECT notional FROM daily_notional WHERE date = ?").get(date);
+    const row = this.db
+      .prepare("SELECT notional FROM daily_notional WHERE date = ?")
+      .get(date) as DailyNotionalRow | undefined;
     return row?.notional || 0;
   }
 
@@ -256,7 +321,9 @@ export class StateStore {
   }
 
   getLastTrade(): { tradeKey?: string; timestampMs?: number } {
-    const row = this.db.prepare("SELECT tradeKey, timestampMs FROM last_trade WHERE id = 1").get();
+    const row = this.db
+      .prepare("SELECT tradeKey, timestampMs FROM last_trade WHERE id = 1")
+      .get() as LastCopiedRow | undefined;
     if (!row) return {};
     return { tradeKey: row.tradeKey || undefined, timestampMs: row.timestampMs || undefined };
   }
