@@ -8,6 +8,13 @@ const META_TTL_MS = 5 * 60 * 1000;
 const API_KEY_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
 const API_KEY_BACKGROUND_RETRY_MS = 2 * 60 * 1000;
 
+function resolveFunderAddress(config: Config): string | undefined {
+  if (config.signatureType === 1 || config.signatureType === 2) {
+    return config.funderAddress;
+  }
+  return undefined;
+}
+
 export async function initClobClients(config: Config): Promise<{
   publicClient: ClobClient;
   tradingClient?: ClobClient;
@@ -23,13 +30,14 @@ export async function initClobClients(config: Config): Promise<{
   const creds = await createOrDeriveApiKeyWithRetry(config, signer);
   let tradingClient: ClobClient | undefined;
   if (creds) {
+    const funderAddress = resolveFunderAddress(config);
     tradingClient = new ClobClient(
       config.clobHost,
       config.chainId,
       signer,
       creds,
       config.signatureType as any,
-      config.funderAddress
+      funderAddress
     );
   } else {
     logger.error("API key creation failed; bot will run in observe-only mode and retry in background");
@@ -46,13 +54,14 @@ export async function initClobClients(config: Config): Promise<{
           try {
             const nextCreds = await createOrDeriveApiKeyWithRetry(config, signer);
             if (nextCreds) {
+              const funderAddress = resolveFunderAddress(config);
               const nextClient = new ClobClient(
                 config.clobHost,
                 config.chainId,
                 signer,
                 nextCreds,
                 config.signatureType as any,
-                config.funderAddress
+                funderAddress
               );
               onReady(nextClient);
               logger.info("API key creation recovered; trading client authenticated");
@@ -111,13 +120,14 @@ async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
     forceDerive: config.forceDeriveApiKey,
   });
 
+  const funderAddress = resolveFunderAddress(config);
   const client = new ClobClient(
     config.clobHost,
     config.chainId,
     signer,
     undefined,
     config.signatureType as any,
-    config.funderAddress
+    funderAddress
   );
   let lastError: unknown;
   for (let attempt = 0; attempt < API_KEY_RETRY_DELAYS_MS.length + 1; attempt += 1) {

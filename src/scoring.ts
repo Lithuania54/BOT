@@ -27,6 +27,15 @@ export async function computeScores(
         const openPnlSum = positions.reduce((sum, row) => sum + (row.cashPnl || 0), 0);
 
         const eligible = sample >= config.minClosedSample;
+        if (!eligible) {
+          logger.info("trader ineligible", {
+            reason: "sample size insufficient",
+            proxyWallet: target.proxyWallet,
+            displayName: target.displayName,
+            sample,
+            minClosedSample: config.minClosedSample,
+          });
+        }
         const score = eligible
           ? roi * 100 + realizedPnlSum / 1000 - config.openPnlPenaltyFactor * Math.max(0, -openPnlSum)
           : -1e9;

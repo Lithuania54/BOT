@@ -30,6 +30,7 @@ export interface Config {
   expirationSafetySeconds: number;
   marketEndSafetySeconds: number;
   balanceErrorCooldownMs: number;
+  noOrderLivenessMs: number;
   autoRedeemEnabled: boolean;
   redeemPollMs: number;
   redeemCooldownMs: number;
@@ -96,6 +97,7 @@ export interface LeaderSelection {
     weight: number;
   }>;
   reason: string;
+  meta?: Record<string, unknown>;
 }
 
 export interface OrderBookMeta {
@@ -115,4 +117,6 @@ export interface MirrorResult {
   limitPrice?: number;
   errorMessage?: string;
   errorStatus?: number | string;
+  errorResponse?: unknown;
+  errorDiagnostics?: Record<string, unknown>;
 }

@@ -14,11 +14,12 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
   const now = Date.now();
   const eligible = scores.filter((s) => s.eligible);
   const sorted = sortScores(eligible);
+  const eligibleCount = eligible.length;
 
   if (config.followMode === "TOPK") {
     const prev = state.getTopKState().leaders;
-    const selected = sorted.filter((s) => !inCooldown(state, s.proxyWallet, config.cooldownMs, now))
-      .slice(0, Math.max(1, config.topK));
+    const cooldownFiltered = sorted.filter((s) => !inCooldown(state, s.proxyWallet, config.cooldownMs, now));
+    const selected = cooldownFiltered.slice(0, Math.max(1, config.topK));
 
     const totalPositive = selected.reduce((sum, s) => sum + (s.score > 0 ? s.score : 0), 0);
     if (selected.length === 0 || totalPositive <= 0) {
@@ -26,10 +27,23 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
         state.setSwitchedAway(prevWallet, now);
       }
       state.setTopKState([]);
+      const reason =
+        selected.length === 0
+          ? eligibleCount === 0
+            ? "no-eligible-leaders"
+            : "cooldown-active"
+          : "no-positive-scores";
       return {
         mode: "TOPK",
         leaders: [],
-        reason: selected.length === 0 ? "no eligible leaders" : "no positive scores",
+        reason,
+        meta: {
+          eligibleCount,
+          selectedCount: selected.length,
+          topK: config.topK,
+          totalPositive,
+          cooldownFilteredCount: cooldownFiltered.length,
+        },
       };
     }
     const leaders = selected.map((s) => ({
@@ -50,7 +64,14 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
     return {
       mode: "TOPK",
       leaders,
-      reason: leaders.length ? "topk selection" : "no eligible leaders",
+      reason: leaders.length < config.topK ? "topk-insufficient" : "topk-selection",
+      meta: {
+        eligibleCount,
+        selectedCount: leaders.length,
+        topK: config.topK,
+        totalPositive,
+        cooldownFilteredCount: cooldownFiltered.length,
+      },
     };
   }
 
@@ -66,7 +87,8 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
       mode: "LEADER",
       leader: best,
       leaders: [{ proxyWallet: best.proxyWallet, displayName: best.displayName, score: best.score, weight: 1 }],
-      reason: "initial leader",
+      reason: "initial-leader",
+      meta: { eligibleCount },
     };
   }
 
@@ -78,14 +100,22 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
         mode: "LEADER",
         leader: best,
         leaders: [{ proxyWallet: best.proxyWallet, displayName: best.displayName, score: best.score, weight: 1 }],
-        reason: "current leader not eligible",
+        reason: "current-leader-ineligible",
+        meta: { eligibleCount },
       };
     }
-    return { mode: "LEADER", leaders: [], reason: "no eligible leader" };
+    const reason =
+      eligibleCount === 0
+        ? "no-eligible-leader"
+        : best && inCooldown(state, best.proxyWallet, config.cooldownMs, now)
+        ? "cooldown-active"
+        : "no-eligible-leader";
+    return { mode: "LEADER", leaders: [], reason, meta: { eligibleCount } };
   }
 
-  const stopCondition =
-    currentScore.score < config.stopScore || currentScore.realizedPnlSum < config.stopRealizedPnl;
+  const stopScoreTriggered = currentScore.score < config.stopScore;
+  const stopRealizedTriggered = currentScore.realizedPnlSum < config.stopRealizedPnl;
+  const stopCondition = stopScoreTriggered || stopRealizedTriggered;
   const holdElapsed = now - currentSince;
   const canSwitch = stopCondition || holdElapsed >= config.minHoldMs;
 
@@ -94,11 +124,27 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
     if (best.score >= threshold && !inCooldown(state, best.proxyWallet, config.cooldownMs, now)) {
       state.setSwitchedAway(currentLeader, now);
       state.setLeaderState(best.proxyWallet, now);
+      const reason = stopScoreTriggered
+        ? "stop-score-triggered"
+        : stopRealizedTriggered
+        ? "stop-realized-pnl-triggered"
+        : "score-improvement";
       return {
         mode: "LEADER",
         leader: best,
         leaders: [{ proxyWallet: best.proxyWallet, displayName: best.displayName, score: best.score, weight: 1 }],
-        reason: stopCondition ? "stop condition" : "score improvement",
+        reason,
+        meta: {
+          eligibleCount,
+          holdElapsedMs: holdElapsed,
+          minHoldMs: config.minHoldMs,
+          stopScore: config.stopScore,
+          stopRealizedPnl: config.stopRealizedPnl,
+          stopScoreTriggered,
+          stopRealizedTriggered,
+          stopCondition,
+          threshold,
+        },
       };
     }
   }
@@ -112,6 +158,16 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
       score: currentScore.score,
       weight: 1,
     }],
-    reason: "holding leader",
+    reason: holdElapsed < config.minHoldMs && !stopCondition ? "min-hold-not-satisfied" : "holding-leader",
+    meta: {
+      eligibleCount,
+      holdElapsedMs: holdElapsed,
+      minHoldMs: config.minHoldMs,
+      stopScore: config.stopScore,
+      stopRealizedPnl: config.stopRealizedPnl,
+      stopScoreTriggered,
+      stopRealizedTriggered,
+      stopCondition,
+    },
   };
 }

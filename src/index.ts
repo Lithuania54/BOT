@@ -1,3 +1,4 @@
+import { AssetType } from "@polymarket/clob-client";
 import { loadConfig } from "./config";
 import { checkGeoblock } from "./api/geoblock";
 import { resolveTargetToProxyWallet } from "./api/gamma";
@@ -11,6 +12,7 @@ import { selectLeaders } from "./selector";
 import { LeaderSelection, ResolvedTarget, Trade } from "./types";
 import { logger } from "./logger";
 import { createLimiter } from "./limiter";
+import { formatUsdcMicro, parseUsdcToMicro } from "./preflight";
 
 const TRADE_LIMIT = 1000;
 const MAX_PAGES = 5;
@@ -89,6 +91,24 @@ async function run() {
       tradingClient = client;
     });
   }
+  logger.info("trading identity", {
+    myUserAddress: config.myUserAddress,
+    funderAddress: config.funderAddress,
+    signatureType: config.signatureType,
+  });
+
+  if (!config.dryRun && tradingClient) {
+    try {
+      const balance = await tradingClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+      logger.info("balance smoke check", {
+        funderAddress: config.funderAddress,
+        balance: formatUsdcMicro(parseUsdcToMicro(balance?.balance)),
+        allowance: formatUsdcMicro(parseUsdcToMicro(balance?.allowance)),
+      });
+    } catch (err) {
+      logger.error("balance smoke check failed", { error: (err as Error).message });
+    }
+  }
 
   startAutoRedeemLoop({
     config,
@@ -99,6 +119,9 @@ async function run() {
   const resolvedTargets = await resolveTargets(config.targets, state);
   let selection: LeaderSelection = { mode: config.followMode, leaders: [], reason: "not evaluated" };
   const failureReasons = new Map<string, string>();
+  let lastSignalMs = 0;
+  let lastOrderMs = 0;
+  let pollTimer: NodeJS.Timeout | undefined;
 
   async function evaluateSelection() {
     const scores = await computeScores(resolvedTargets, config, state);
@@ -106,6 +129,7 @@ async function run() {
     logger.info("selection updated", {
       mode: selection.mode,
       reason: selection.reason,
+      meta: selection.meta,
       leaders: selection.leaders.map((l) => ({
         proxyWallet: l.proxyWallet,
         displayName: l.displayName,
@@ -135,6 +159,7 @@ async function run() {
             for (const trade of trades) {
               const { copy, weight } = shouldCopyTrade(selection, trade);
               if (!copy) continue;
+              lastSignalMs = Date.now();
               const keyResult = buildTradeKey(trade);
               if (!keyResult.key) {
                 if (keyResult.persistKey && state.hasProcessed(keyResult.persistKey)) {
@@ -157,6 +182,7 @@ async function run() {
                 }
                 if (result.status === "placed" || result.status === "dry_run") {
                   state.setLastTrade(key, trade.timestampMs);
+                  lastOrderMs = Date.now();
                 }
                 const logPayload = {
                   proxyWallet: trade.proxyWallet,
@@ -171,6 +197,8 @@ async function run() {
                   orderId: result.orderId,
                   error: result.errorMessage,
                   errorStatus: result.errorStatus,
+                  errorResponse: result.errorResponse,
+                  errorDiagnostics: result.errorDiagnostics,
                 };
                 if (result.status === "failed") {
                   logger.warn("trade mirrored", logPayload);
@@ -204,10 +232,31 @@ async function run() {
     }
   }
 
+  function startPollingLoop() {
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(() => {
+      pollTrades().catch((err) => logger.error("poll failed", { error: (err as Error).message }));
+    }, config.pollMs);
+  }
+
   await pollTrades();
+  startPollingLoop();
+
   setInterval(() => {
-    pollTrades().catch((err) => logger.error("poll failed", { error: (err as Error).message }));
-  }, config.pollMs);
+    const now = Date.now();
+    if (!lastSignalMs || !config.noOrderLivenessMs) return;
+    if (now - lastSignalMs <= config.noOrderLivenessMs && now - lastOrderMs > config.noOrderLivenessMs) {
+      logger.error("liveness watchdog: signals received but no successful order", {
+        lastSignalMs,
+        lastOrderMs: lastOrderMs || null,
+        lastSignalAgeMs: now - lastSignalMs,
+        lastOrderAgeMs: lastOrderMs ? now - lastOrderMs : null,
+        windowMs: config.noOrderLivenessMs,
+      });
+      startPollingLoop();
+      pollTrades().catch((err) => logger.error("poll failed", { error: (err as Error).message }));
+    }
+  }, Math.max(60000, config.pollMs * 5));
 
   setInterval(() => {
     const leaderState = state.getLeaderState();

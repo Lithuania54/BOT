@@ -1,4 +1,4 @@
-import { ClobClient, OrderType, Side } from "@polymarket/clob-client";
+import { AssetType, ClobClient, OrderType, Side, UserOrder } from "@polymarket/clob-client";
 import { Config, MirrorResult, Trade } from "./types";
 import { StateStore } from "./state";
 import { fetchPositions } from "./api/dataApi";
@@ -11,10 +11,29 @@ import {
   roundPriceToTick,
 } from "./clob";
 import { logger } from "./logger";
+import {
+  calculateAvailableUsdcMicro,
+  computeReservedUsdcMicro,
+  formatUsdcMicro,
+  parseUsdcToMicro,
+} from "./preflight";
 
 const DEBUG_LOG_LIMIT = 3;
+const ORDER_RETRY_DELAYS_MS = [1000, 2000, 4000];
+const AUTH_BACKOFF_MS = 60 * 1000;
 let debugLogged = 0;
 let balanceCooldownUntilMs = 0;
+let lastAuthOkMs = 0;
+let authFailure: { message: string; status?: number | string; at: number } | null = null;
+let lastPreflightSnapshot:
+  | {
+      balanceMicro: bigint;
+      allowanceMicro: bigint;
+      reservedMicro: bigint;
+      availableMicro: bigint;
+      at: number;
+    }
+  | null = null;
 
 function todayKey(): string {
   const now = new Date();
@@ -33,6 +52,17 @@ function roundSize(value: number, precision: number): number {
   if (precision <= 0) return Math.floor(value);
   const factor = Math.pow(10, precision);
   return Math.floor(value * factor) / factor;
+}
+
+function logDecision(reasonCode: string, trade: Trade, extra?: Record<string, unknown>) {
+  logger.warn("trade skipped", {
+    reasonCode,
+    proxyWallet: trade.proxyWallet,
+    conditionId: trade.conditionId,
+    outcomeIndex: trade.outcomeIndex,
+    side: trade.side,
+    ...extra,
+  });
 }
 
 // Market end fields are parsed from Gamma metadata (ISO string, unix seconds, or unix ms).
@@ -74,20 +104,37 @@ function parseMarketEndMs(market: any): number | null {
   return null;
 }
 
+function getMissingTradeFields(trade: Trade): string[] {
+  const missing: string[] = [];
+  if (!trade.proxyWallet) missing.push("proxyWallet");
+  if (!trade.transactionHash) missing.push("transactionHash");
+  if (!trade.conditionId) missing.push("conditionId");
+  if (!Number.isFinite(trade.outcomeIndex)) missing.push("outcomeIndex");
+  if (trade.side !== "BUY" && trade.side !== "SELL") missing.push("side");
+  if (!Number.isFinite(trade.size)) missing.push("size");
+  if (!Number.isFinite(trade.price)) missing.push("price");
+  if (!Number.isFinite(trade.timestampMs)) missing.push("timestamp");
+  return missing;
+}
+
 function isBalanceCooldownActive(config: Config): boolean {
   if (config.balanceErrorCooldownMs <= 0) return false;
   return Date.now() < balanceCooldownUntilMs;
 }
 
-function maybeTriggerBalanceCooldown(config: Config, message?: string) {
-  if (!message) return;
+function isBalanceOrAllowanceError(message: string): boolean {
   const lower = message.toLowerCase();
-  const isBalanceError =
+  return (
     lower.includes("not enough balance") ||
     lower.includes("insufficient balance") ||
     lower.includes("insufficient funds") ||
-    lower.includes("allowance");
-  if (!isBalanceError) return;
+    lower.includes("allowance")
+  );
+}
+
+function maybeTriggerBalanceCooldown(config: Config, message?: string) {
+  if (!message) return;
+  if (!isBalanceOrAllowanceError(message)) return;
   const until = Date.now() + config.balanceErrorCooldownMs;
   if (until > balanceCooldownUntilMs) {
     balanceCooldownUntilMs = until;
@@ -98,11 +145,95 @@ function maybeTriggerBalanceCooldown(config: Config, message?: string) {
   }
 }
 
-function extractErrorInfo(err: unknown): { message: string; status?: number | string } {
+function extractErrorInfo(err: unknown): { message: string; status?: number | string; body?: unknown } {
   const anyErr = err as any;
   const message = anyErr?.message || "unknown error";
   const status = anyErr?.response?.status ?? anyErr?.status ?? anyErr?.code;
-  return { message, status };
+  const body = anyErr?.response?.data ?? anyErr?.data;
+  return { message, status, body };
+}
+
+function isAuthError(info: { message: string; status?: number | string }): boolean {
+  const statusNum = Number(info.status);
+  if (statusNum === 401 || statusNum === 403) return true;
+  const msg = info.message.toLowerCase();
+  return msg.includes("unauthorized") || msg.includes("invalid api key") || msg.includes("api key");
+}
+
+function isNonceOrGasError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("nonce") ||
+    lower.includes("replacement") ||
+    lower.includes("underpriced") ||
+    lower.includes("gas") ||
+    lower.includes("fee too low")
+  );
+}
+
+function isExpirationError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes("gtd") || lower.includes("expiration");
+}
+
+function logCriticalOrderError(message: string, context: Record<string, unknown>) {
+  const lower = message.toLowerCase();
+  if (lower.includes("invalid_signature")) {
+    logger.error("order failed: invalid signature", { reasonCode: "INVALID_SIGNATURE", ...context, error: message });
+  } else if (lower.includes("invalid funder") || lower.includes("funder address")) {
+    logger.error("order failed: invalid funder address", {
+      reasonCode: "INVALID_FUNDER_ADDRESS",
+      ...context,
+      error: message,
+    });
+  } else if (isBalanceOrAllowanceError(message)) {
+    logger.error("order failed: insufficient balance or allowance", {
+      reasonCode: "INSUFFICIENT_BALANCE_ALLOWANCE",
+      ...context,
+      error: message,
+    });
+  } else if (lower.includes("order expired") || lower.includes("expired")) {
+    logger.error("order failed: order expired", { reasonCode: "ORDER_EXPIRED", ...context, error: message });
+  }
+}
+
+function markAuthOk() {
+  lastAuthOkMs = Date.now();
+  authFailure = null;
+}
+
+function markAuthFailure(message: string, status?: number | string) {
+  authFailure = { message, status, at: Date.now() };
+}
+
+function snapshotPreflight(
+  balanceMicro: bigint,
+  allowanceMicro: bigint,
+  reservedMicro: bigint,
+  availableMicro: bigint
+) {
+  lastPreflightSnapshot = {
+    balanceMicro,
+    allowanceMicro,
+    reservedMicro,
+    availableMicro,
+    at: Date.now(),
+  };
+}
+
+function getPreflightDiagnostics(): Record<string, unknown> | undefined {
+  if (!lastPreflightSnapshot) return undefined;
+  return {
+    balance: formatUsdcMicro(lastPreflightSnapshot.balanceMicro),
+    allowance: formatUsdcMicro(lastPreflightSnapshot.allowanceMicro),
+    reservedInOpenOrders: formatUsdcMicro(lastPreflightSnapshot.reservedMicro),
+    availableToTrade: formatUsdcMicro(lastPreflightSnapshot.availableMicro),
+    preflightAt: new Date(lastPreflightSnapshot.at).toISOString(),
+  };
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function tradeSnippet(trade: Trade) {
@@ -118,19 +249,12 @@ function tradeSnippet(trade: Trade) {
 }
 
 function validateTradeRequiredFields(trade: Trade, logIfInvalid: boolean): boolean {
-  const missing: string[] = [];
-  if (!trade.proxyWallet) missing.push("proxyWallet");
-  if (!trade.transactionHash) missing.push("transactionHash");
-  if (!trade.conditionId) missing.push("conditionId");
-  if (!Number.isFinite(trade.outcomeIndex)) missing.push("outcomeIndex");
-  if (trade.side !== "BUY" && trade.side !== "SELL") missing.push("side");
-  if (!Number.isFinite(trade.size)) missing.push("size");
-  if (!Number.isFinite(trade.price)) missing.push("price");
-  if (!Number.isFinite(trade.timestampMs)) missing.push("timestamp");
+  const missing = getMissingTradeFields(trade);
 
   if (missing.length > 0) {
     if (logIfInvalid) {
       logger.warn("trade skipped", {
+        reasonCode: "SKIP_MISSING_REQUIRED_FIELDS",
         reason: "missing required trade fields",
         missing,
         snippet: tradeSnippet(trade),
@@ -139,6 +263,267 @@ function validateTradeRequiredFields(trade: Trade, logIfInvalid: boolean): boole
     return false;
   }
   return true;
+}
+
+type PreflightResult =
+  | {
+      ok: true;
+      authOk: true;
+      walletAddress?: string;
+      funderAddress?: string;
+      signatureType: number;
+      balanceMicro: bigint;
+      allowanceMicro: bigint;
+      reservedMicro: bigint;
+      availableMicro: bigint;
+      lastAuthOkMs: number;
+    }
+  | {
+      ok: false;
+      authOk: boolean;
+      reasonCode: string;
+      reason: string;
+      context: Record<string, unknown>;
+    };
+
+async function getSignerAddress(client: ClobClient): Promise<string | undefined> {
+  try {
+    if (!client.signer) return undefined;
+    return await client.signer.getAddress();
+  } catch {
+    return undefined;
+  }
+}
+
+function isValidAddress(value: string | undefined): boolean {
+  if (!value) return false;
+  return /^0x[0-9a-fA-F]{40}$/.test(value);
+}
+
+async function tradingPreflight(
+  tradingClient: ClobClient,
+  config: Config,
+  notional: number
+): Promise<PreflightResult> {
+  const walletAddress = await getSignerAddress(tradingClient);
+  const funderAddress = config.funderAddress;
+  const signatureType = config.signatureType;
+  const baseContext: Record<string, unknown> = {
+    walletAddress,
+    funderAddress,
+    signatureType,
+    myUserAddress: config.myUserAddress,
+    lastAuthOkMs: lastAuthOkMs || null,
+  };
+
+  if (signatureType === 0) {
+    if (funderAddress && walletAddress && funderAddress.toLowerCase() !== walletAddress.toLowerCase()) {
+      return {
+        ok: false,
+        authOk: true,
+        reasonCode: "SKIP_FUNDER_MISMATCH",
+        reason: "funder address does not match signer for signatureType=0",
+        context: baseContext,
+      };
+    }
+  } else if (signatureType === 1 || signatureType === 2) {
+    if (!isValidAddress(funderAddress)) {
+      return {
+        ok: false,
+        authOk: true,
+        reasonCode: "SKIP_INVALID_FUNDER",
+        reason: "funder address missing or invalid for proxy signatures",
+        context: baseContext,
+      };
+    }
+    if (config.myUserAddress && funderAddress && config.myUserAddress.toLowerCase() !== funderAddress.toLowerCase()) {
+      return {
+        ok: false,
+        authOk: true,
+        reasonCode: "SKIP_FUNDER_MISMATCH",
+        reason: "funder address does not match MY_USER_ADDRESS",
+        context: baseContext,
+      };
+    }
+  } else {
+    return {
+      ok: false,
+      authOk: true,
+      reasonCode: "SKIP_INVALID_SIGNATURE_TYPE",
+      reason: "signatureType must be 0, 1, or 2",
+      context: baseContext,
+    };
+  }
+
+  if (authFailure && Date.now() - authFailure.at < AUTH_BACKOFF_MS) {
+    return {
+      ok: false,
+      authOk: false,
+      reasonCode: "SKIP_AUTH_FAIL",
+      reason: "recent authentication failure",
+      context: { ...baseContext, authFailure },
+    };
+  }
+
+  let balanceMicro = 0n;
+  let allowanceMicro = 0n;
+  let reservedMicro = 0n;
+  try {
+    const balanceResp = await tradingClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
+    balanceMicro = parseUsdcToMicro(balanceResp?.balance);
+    allowanceMicro = parseUsdcToMicro(balanceResp?.allowance);
+  } catch (err) {
+    const info = extractErrorInfo(err);
+    if (isAuthError(info)) {
+      markAuthFailure(info.message, info.status);
+      return {
+        ok: false,
+        authOk: false,
+        reasonCode: "SKIP_AUTH_FAIL",
+        reason: "authentication failed",
+        context: { ...baseContext, error: info.message, status: info.status, response: info.body },
+      };
+    }
+    return {
+      ok: false,
+      authOk: false,
+      reasonCode: "SKIP_PREFLIGHT_ERROR",
+      reason: "balance/allowance check failed",
+      context: { ...baseContext, error: info.message, status: info.status, response: info.body },
+    };
+  }
+
+  let openOrders: unknown;
+  try {
+    openOrders = await tradingClient.getOpenOrders(undefined, true);
+  } catch (err) {
+    const info = extractErrorInfo(err);
+    if (isAuthError(info)) {
+      markAuthFailure(info.message, info.status);
+      return {
+        ok: false,
+        authOk: false,
+        reasonCode: "SKIP_AUTH_FAIL",
+        reason: "authentication failed",
+        context: { ...baseContext, error: info.message, status: info.status, response: info.body },
+      };
+    }
+    return {
+      ok: false,
+      authOk: false,
+      reasonCode: "SKIP_PREFLIGHT_ERROR",
+      reason: "open orders check failed",
+      context: { ...baseContext, error: info.message, status: info.status, response: info.body },
+    };
+  }
+
+  const ordersArray = Array.isArray(openOrders) ? openOrders : [];
+  reservedMicro = computeReservedUsdcMicro(ordersArray);
+  const availableMicro = calculateAvailableUsdcMicro(balanceMicro, allowanceMicro, reservedMicro);
+
+  markAuthOk();
+  snapshotPreflight(balanceMicro, allowanceMicro, reservedMicro, availableMicro);
+
+  const neededMicro = parseUsdcToMicro(notional.toFixed(6));
+  const context = {
+    ...baseContext,
+    balance: formatUsdcMicro(balanceMicro),
+    allowance: formatUsdcMicro(allowanceMicro),
+    reservedInOpenOrders: formatUsdcMicro(reservedMicro),
+    availableToTrade: formatUsdcMicro(availableMicro),
+    neededNotional: formatUsdcMicro(neededMicro),
+    openOrdersCount: ordersArray.length,
+  };
+
+  if (availableMicro < neededMicro) {
+    if (allowanceMicro < neededMicro) {
+      return {
+        ok: false,
+        authOk: true,
+        reasonCode: "SKIP_ALLOWANCE_LOW",
+        reason: "allowance too low for desired notional",
+        context: {
+          ...context,
+          advice: "Increase USDC.e allowance for trading in the Polymarket UI.",
+        },
+      };
+    }
+    if (reservedMicro > 0n && availableMicro === 0n) {
+      return {
+        ok: false,
+        authOk: true,
+        reasonCode: "SKIP_RESERVED_OPEN_ORDERS",
+        reason: "collateral reserved in open orders",
+        context: {
+          ...context,
+          advice: "Cancel open BUY orders or wait for fills to free collateral.",
+        },
+      };
+    }
+    return {
+      ok: false,
+      authOk: true,
+      reasonCode: "SKIP_NO_AVAILABLE_COLLATERAL",
+      reason: "insufficient available collateral",
+      context: {
+        ...context,
+        advice: "Check USDC.e balance and allowance.",
+      },
+    };
+  }
+
+  return {
+    ok: true,
+    authOk: true,
+    walletAddress,
+    funderAddress,
+    signatureType,
+    balanceMicro,
+    allowanceMicro,
+    reservedMicro,
+    availableMicro,
+    lastAuthOkMs,
+  };
+}
+
+function extractResponseMessage(resp: any): string | undefined {
+  return (
+    resp?.message ||
+    resp?.errorMsg ||
+    resp?.error_message ||
+    resp?.error ||
+    resp?.data?.message ||
+    resp?.data?.error
+  );
+}
+
+function extractResponseStatus(resp: any): number | string | undefined {
+  return resp?.status ?? resp?.statusCode ?? resp?.code;
+}
+
+type LimitOrderType = OrderType.GTC | OrderType.GTD;
+
+async function createAndPostWithRetry(
+  client: ClobClient,
+  userOrder: UserOrder,
+  options: any,
+  orderType: LimitOrderType
+): Promise<any> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= ORDER_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      return await client.createAndPostOrder(userOrder, options, orderType);
+    } catch (err) {
+      lastErr = err;
+      const info = extractErrorInfo(err);
+      if (isNonceOrGasError(info.message) && attempt < ORDER_RETRY_DELAYS_MS.length) {
+        await sleep(ORDER_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr;
 }
 
 export function buildTradeKey(trade: Trade): {
@@ -171,35 +556,14 @@ function validateTokenId(
   lookupSummary: Record<string, unknown>
 ): { ok: boolean; reason?: string } {
   if (!tokenId || typeof tokenId !== "string") {
-    logger.warn("trade skipped", {
-      reason: "missing tokenId",
-      conditionId,
-      outcomeIndex,
-      tokenID: tokenId,
-      marketLookupResponseSummary: lookupSummary,
-    });
     return { ok: false, reason: "missing tokenId" };
   }
 
   if (tokenId === conditionId || /^0x[0-9a-fA-F]{64}$/.test(tokenId)) {
-    logger.warn("trade skipped", {
-      reason: "tokenID looks like conditionId",
-      conditionId,
-      outcomeIndex,
-      tokenID: tokenId,
-      marketLookupResponseSummary: lookupSummary,
-    });
     return { ok: false, reason: "tokenID looks like conditionId" };
   }
 
   if (/^0x[0-9a-fA-F]{40}$/.test(tokenId)) {
-    logger.warn("trade skipped", {
-      reason: "tokenID looks like address",
-      conditionId,
-      outcomeIndex,
-      tokenID: tokenId,
-      marketLookupResponseSummary: lookupSummary,
-    });
     return { ok: false, reason: "tokenID looks like address" };
   }
 
@@ -214,7 +578,12 @@ export async function mirrorTrade(
   publicClient: ClobClient,
   tradingClient?: ClobClient
 ): Promise<MirrorResult> {
-  if (!validateTradeRequiredFields(trade, false)) {
+  const missingFields = getMissingTradeFields(trade);
+  if (missingFields.length > 0) {
+    logDecision("SKIP_MISSING_REQUIRED_FIELDS", trade, {
+      missing: missingFields,
+      snippet: tradeSnippet(trade),
+    });
     return { status: "skipped", reason: "missing required trade fields" };
   }
 
@@ -226,13 +595,16 @@ export async function mirrorTrade(
   };
   const tokenValidation = validateTokenId(tokenId, trade.conditionId, trade.outcomeIndex, lookupSummary);
   if (!tokenValidation.ok) {
+    logDecision("SKIP_INVALID_TOKEN_ID", trade, {
+      reason: tokenValidation.reason,
+      tokenID: tokenId,
+      marketLookupResponseSummary: lookupSummary,
+    });
     return { status: "skipped", reason: tokenValidation.reason || "invalid tokenId" };
   }
 
   if (trade.side === "BUY" && isBalanceCooldownActive(config)) {
-    logger.warn("trade skipped", {
-      reason: "balance/allowance cooldown",
-      conditionId: trade.conditionId,
+    logDecision("SKIP_BALANCE_COOLDOWN", trade, {
       tokenID: tokenId,
       cooldownUntil: new Date(balanceCooldownUntilMs).toISOString(),
     });
@@ -244,9 +616,9 @@ export async function mirrorTrade(
     try {
       const { market, strict } = await getMarketByConditionId(trade.conditionId);
       if (!market) {
-        logger.warn("trade skipped", {
-          reason: "market metadata unavailable",
-          conditionId: trade.conditionId,
+        logDecision("SKIP_MARKET_METADATA_UNAVAILABLE", trade, {
+          tokenID: tokenId,
+          strict,
         });
         return { status: "skipped", reason: "market metadata unavailable" };
       }
@@ -256,9 +628,8 @@ export async function mirrorTrade(
       const isArchived = Boolean(market?.archived);
       const isActive = market?.active;
       if (isClosed || isArchived || isActive === false) {
-        logger.warn("trade skipped", {
-          reason: "market closed/inactive",
-          conditionId: trade.conditionId,
+        logDecision("SKIP_MARKET_CLOSED", trade, {
+          tokenID: tokenId,
           marketTitle,
           closed: isClosed,
           archived: isArchived,
@@ -270,9 +641,8 @@ export async function mirrorTrade(
 
       const endMs = parseMarketEndMs(market);
       if (!endMs) {
-        logger.warn("trade skipped", {
-          reason: "missing market end time",
-          conditionId: trade.conditionId,
+        logDecision("SKIP_MARKET_END_UNKNOWN", trade, {
+          tokenID: tokenId,
           marketTitle,
           closed: isClosed,
           active: isActive,
@@ -284,9 +654,8 @@ export async function mirrorTrade(
       const nowMs = Date.now();
       const safetyMs = config.marketEndSafetySeconds * 1000;
       if (nowMs >= endMs - safetyMs) {
-        logger.warn("trade skipped", {
-          reason: "market expired/too close to end",
-          conditionId: trade.conditionId,
+        logDecision("SKIP_MARKET_EXPIRED", trade, {
+          tokenID: tokenId,
           marketTitle,
           nowMs,
           marketEndMs: endMs,
@@ -298,9 +667,8 @@ export async function mirrorTrade(
       const maxTtlSeconds = Math.floor((endMs - nowMs) / 1000) - config.expirationSafetySeconds;
       const ttlSeconds = Math.min(config.orderTtlSeconds, maxTtlSeconds);
       if (ttlSeconds <= 1) {
-        logger.warn("trade skipped", {
-          reason: "order TTL crosses market end",
-          conditionId: trade.conditionId,
+        logDecision("SKIP_ORDER_TTL_CROSSES_END", trade, {
+          tokenID: tokenId,
           marketTitle,
           nowMs,
           marketEndMs: endMs,
@@ -311,10 +679,11 @@ export async function mirrorTrade(
       }
       buyOrderTtlSeconds = ttlSeconds;
     } catch (err) {
-      logger.warn("market end lookup failed", { conditionId: trade.conditionId, error: (err as Error).message });
-      logger.warn("trade skipped", {
-        reason: "market metadata unavailable",
-        conditionId: trade.conditionId,
+      const info = extractErrorInfo(err);
+      logDecision("SKIP_MARKET_METADATA_UNAVAILABLE", trade, {
+        tokenID: tokenId,
+        error: info.message,
+        status: info.status,
       });
       return { status: "skipped", reason: "market metadata unavailable" };
     }
@@ -333,12 +702,8 @@ export async function mirrorTrade(
   }
 
   if (!Number.isFinite(execPrice) || execPrice <= 0) {
-    logger.warn("trade skipped", {
-      reason: "invalid exec price",
-      conditionId: trade.conditionId,
-      outcomeIndex: trade.outcomeIndex,
+    logDecision("SKIP_INVALID_EXEC_PRICE", trade, {
       tokenID: tokenId,
-      side: trade.side,
       bookTop: bookResult.top,
       rawGetPriceResponse,
       error: execError,
@@ -360,21 +725,36 @@ export async function mirrorTrade(
 
   const tradeNotional = trade.price * trade.size;
   if (tradeNotional <= 0) {
+    logDecision("SKIP_INVALID_TRADE_NOTIONAL", trade, {
+      tokenID: tokenId,
+      tradeNotional,
+    });
     return { status: "skipped", reason: "invalid trade notional" };
   }
 
   if (weight <= 0) {
+    logDecision("SKIP_NON_POSITIVE_WEIGHT", trade, { tokenID: tokenId, weight });
     return { status: "skipped", reason: "non-positive weight" };
   }
 
   const desiredNotional = Math.min(tradeNotional * config.copyRatio * weight, config.maxUsdcPerTrade);
   if (desiredNotional <= 0) {
+    logDecision("SKIP_NON_POSITIVE_NOTIONAL", trade, {
+      tokenID: tokenId,
+      desiredNotional,
+    });
     return { status: "skipped", reason: "non-positive desired notional" };
   }
   if (config.maxDailyUsdc !== undefined) {
     const dateKey = todayKey();
     const spent = state.getDailyNotional(dateKey);
     if (spent + desiredNotional > config.maxDailyUsdc) {
+      logDecision("SKIP_DAILY_CAP", trade, {
+        tokenID: tokenId,
+        spent,
+        desiredNotional,
+        maxDailyUsdc: config.maxDailyUsdc,
+      });
       return { status: "skipped", reason: "daily cap reached" };
     }
   }
@@ -395,6 +775,11 @@ export async function mirrorTrade(
   const sizePrecision = countDecimals(meta.minOrderSize);
   shares = roundSize(shares, sizePrecision);
   if (shares <= 0 || shares < minOrderSize) {
+    logDecision("SKIP_MIN_SIZE", trade, {
+      tokenID: tokenId,
+      shares,
+      minOrderSize,
+    });
     return { status: "skipped", reason: "size below min" };
   }
 
@@ -404,6 +789,10 @@ export async function mirrorTrade(
       : execPrice * (1 - config.slippagePct);
   const limitPrice = roundPriceToTick(limitPriceRaw, meta.tickSize, trade.side);
   if (limitPrice <= 0) {
+    logDecision("SKIP_INVALID_LIMIT_PRICE", trade, {
+      tokenID: tokenId,
+      limitPriceRaw,
+    });
     return { status: "skipped", reason: "invalid limit price" };
   }
 
@@ -412,7 +801,21 @@ export async function mirrorTrade(
     const dateKey = todayKey();
     const spent = state.getDailyNotional(dateKey);
     if (spent + notional > config.maxDailyUsdc) {
+      logDecision("SKIP_DAILY_CAP", trade, {
+        tokenID: tokenId,
+        spent,
+        notional,
+        maxDailyUsdc: config.maxDailyUsdc,
+      });
       return { status: "skipped", reason: "daily cap reached" };
+    }
+  }
+
+  if (trade.side === "BUY" && !config.dryRun && tradingClient) {
+    const preflight = await tradingPreflight(tradingClient, config, notional);
+    if (!preflight.ok) {
+      logDecision(preflight.reasonCode, trade, preflight.context);
+      return { status: "skipped", reason: preflight.reason };
     }
   }
 
@@ -429,76 +832,93 @@ export async function mirrorTrade(
     ttlSeconds,
     config.expirationSafetySeconds
   );
-  const userOrder = {
+  const userOrder: UserOrder = {
     tokenID: tokenId,
     price: limitPrice,
     size: shares,
     side: trade.side === "BUY" ? Side.BUY : Side.SELL,
     expiration,
   };
+  const orderOptions = {
+    tickSize: meta.tickSize as any,
+    negRisk: meta.negRisk,
+  };
+  const userOrderNoExp: UserOrder = {
+    tokenID: tokenId,
+    price: limitPrice,
+    size: shares,
+    side: trade.side === "BUY" ? Side.BUY : Side.SELL,
+  };
 
-  try {
-    const resp = await tradingClient.createAndPostOrder(userOrder, {
-      tickSize: meta.tickSize as any,
-      negRisk: meta.negRisk,
-    }, OrderType.GTD);
-    state.addDailyNotional(todayKey(), notional);
-    const orderId = resp?.orderID ?? resp?.orderId ?? resp?.id;
-    if (resp?.success === false) {
-      maybeTriggerBalanceCooldown(config, resp?.message);
-      return {
-        status: "failed",
-        reason: "order rejected",
-        errorMessage: resp?.message || "CLOB rejected order",
-        errorStatus: resp?.status,
-      };
+  const attemptOrder = async (order: UserOrder, orderType: LimitOrderType) => {
+    try {
+      const resp = await createAndPostWithRetry(tradingClient, order, orderOptions, orderType);
+      return { resp };
+    } catch (err) {
+      return { error: extractErrorInfo(err) };
     }
-    return { status: "placed", reason: "order placed", orderId, notional, size: shares, limitPrice };
-  } catch (err) {
-    const info = extractErrorInfo(err);
-    const message = info.message || "unknown error";
-    if (message.toLowerCase().includes("gtd") || message.toLowerCase().includes("expiration")) {
-      logger.warn("GTD order failed, falling back to GTC", { error: message });
-      const userOrderNoExp = {
-        tokenID: tokenId,
-        price: limitPrice,
-        size: shares,
-        side: trade.side === "BUY" ? Side.BUY : Side.SELL,
-      };
-      try {
-        const resp = await tradingClient.createAndPostOrder(userOrderNoExp, {
-          tickSize: meta.tickSize as any,
-          negRisk: meta.negRisk,
-        }, OrderType.GTC);
-        state.addDailyNotional(todayKey(), notional);
-        const orderId = resp?.orderID ?? resp?.orderId ?? resp?.id;
-        if (resp?.success === false) {
-          maybeTriggerBalanceCooldown(config, resp?.message);
-          return {
-            status: "failed",
-            reason: "order rejected",
-            errorMessage: resp?.message || "CLOB rejected order",
-            errorStatus: resp?.status,
-          };
-        }
-        return { status: "placed", reason: "order placed", orderId, notional, size: shares, limitPrice };
-      } catch (fallbackErr) {
-        const fallbackInfo = extractErrorInfo(fallbackErr);
-        maybeTriggerBalanceCooldown(config, fallbackInfo.message);
-        return {
-          status: "failed",
-          reason: "order failed",
-          errorMessage: fallbackInfo.message,
-          errorStatus: fallbackInfo.status,
-        };
-      }
+  };
+
+  let attempt = await attemptOrder(userOrder, OrderType.GTD);
+  if (attempt.error && isExpirationError(attempt.error.message)) {
+    logger.warn("GTD order failed, falling back to GTC", { error: attempt.error.message });
+    attempt = await attemptOrder(userOrderNoExp, OrderType.GTC);
+  } else if (attempt.resp?.success === false) {
+    const message = extractResponseMessage(attempt.resp) || "CLOB rejected order";
+    if (isExpirationError(message)) {
+      logger.warn("GTD order rejected due to expiration, falling back to GTC", { error: message });
+      attempt = await attemptOrder(userOrderNoExp, OrderType.GTC);
     }
-    maybeTriggerBalanceCooldown(config, info.message);
+  }
+
+  if (attempt.error) {
+    if (isAuthError(attempt.error)) {
+      markAuthFailure(attempt.error.message, attempt.error.status);
+    }
+    maybeTriggerBalanceCooldown(config, attempt.error.message);
+    logCriticalOrderError(attempt.error.message, {
+      tokenID: tokenId,
+      conditionId: trade.conditionId,
+      outcomeIndex: trade.outcomeIndex,
+      side: trade.side,
+    });
+    const diagnostics = isBalanceOrAllowanceError(attempt.error.message) ? getPreflightDiagnostics() : undefined;
     return {
       status: "failed",
-      reason: "order failed",
-      errorMessage: info.message,
-      errorStatus: info.status,
+      reason: isAuthError(attempt.error) ? "auth failed" : "order failed",
+      errorMessage: attempt.error.message,
+      errorStatus: attempt.error.status,
+      errorResponse: attempt.error.body,
+      errorDiagnostics: diagnostics,
     };
   }
+
+  const resp = attempt.resp;
+  const orderId = resp?.orderID ?? resp?.orderId ?? resp?.id;
+  if (resp?.success === false) {
+    const message = extractResponseMessage(resp) || "CLOB rejected order";
+    const status = extractResponseStatus(resp);
+    if (isAuthError({ message, status })) {
+      markAuthFailure(message, status);
+    }
+    maybeTriggerBalanceCooldown(config, message);
+    logCriticalOrderError(message, {
+      tokenID: tokenId,
+      conditionId: trade.conditionId,
+      outcomeIndex: trade.outcomeIndex,
+      side: trade.side,
+    });
+    const diagnostics = isBalanceOrAllowanceError(message) ? getPreflightDiagnostics() : undefined;
+    return {
+      status: "failed",
+      reason: "order rejected",
+      errorMessage: message,
+      errorStatus: status,
+      errorResponse: resp,
+      errorDiagnostics: diagnostics,
+    };
+  }
+
+  state.addDailyNotional(todayKey(), notional);
+  return { status: "placed", reason: "order placed", orderId, notional, size: shares, limitPrice };
 }
