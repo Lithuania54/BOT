@@ -102,10 +102,15 @@ export function loadConfig(): Config {
     orderTtlSeconds: parseNumber("ORDER_TTL_SECONDS", 60),
     expirationSafetySeconds: parseNumber("EXPIRATION_SAFETY_SECONDS", 60),
     marketEndSafetySeconds: parseNumber("MARKET_END_SAFETY_SECONDS", 120),
+    balanceErrorCooldownMs: parseNumber("BALANCE_ERROR_COOLDOWN_MS", 900000),
     autoRedeemEnabled: parseBoolean("AUTO_REDEEM_ENABLED", false),
     redeemPollMs: parseNumber("REDEEM_POLL_MS", 300000),
     redeemCooldownMs: parseNumber("REDEEM_COOLDOWN_MS", 3600000),
     rpcUrl: parseRpcUrl(),
+    polyApiKey: process.env.POLY_API_KEY,
+    polyApiSecret: process.env.POLY_API_SECRET,
+    polyApiPassphrase: process.env.POLY_API_PASSPHRASE,
+    forceDeriveApiKey: parseBoolean("FORCE_DERIVE_API_KEY", false),
   };
 
   if (!config.dryRun) {

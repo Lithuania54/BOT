@@ -29,10 +29,15 @@ export interface Config {
   orderTtlSeconds: number;
   expirationSafetySeconds: number;
   marketEndSafetySeconds: number;
+  balanceErrorCooldownMs: number;
   autoRedeemEnabled: boolean;
   redeemPollMs: number;
   redeemCooldownMs: number;
   rpcUrl?: string;
+  polyApiKey?: string;
+  polyApiSecret?: string;
+  polyApiPassphrase?: string;
+  forceDeriveApiKey: boolean;
 }
 
 export interface ResolvedTarget {

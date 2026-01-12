@@ -180,7 +180,10 @@ export function startAutoRedeemLoop(deps: {
   const loop = async () => {
     try {
       const ready = await ensureSafeReady();
-      if (!ready) return;
+      if (!ready) {
+        logger.warn("auto-redeem skipped", { reason: "safe not ready" });
+        return;
+      }
 
       const positions = await fetchPositions(config.funderAddress as string);
       const conditionIds = new Set<string>();
@@ -193,10 +196,20 @@ export function startAutoRedeemLoop(deps: {
       for (const conditionId of conditionIds) {
         try {
           const market = await publicClient.getMarket(conditionId);
-          if (!market?.closed) continue;
+          if (!market?.closed) {
+            logger.info("auto-redeem skipped", { conditionId, reason: "market not closed" });
+            continue;
+          }
 
           const now = Date.now();
-          if (!shouldAttempt(conditionId, now)) continue;
+          if (!shouldAttempt(conditionId, now)) {
+            logger.info("auto-redeem skipped", {
+              conditionId,
+              reason: "cooldown",
+              nextAllowed: new Date((lastAttemptMs.get(conditionId) || 0) + config.redeemCooldownMs).toISOString(),
+            });
+            continue;
+          }
           markAttempt(conditionId, now);
 
           logger.info("market resolved", { conditionId });

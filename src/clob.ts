@@ -1,4 +1,4 @@
-import { ClobClient, Side } from "@polymarket/clob-client";
+import { ApiKeyCreds, ClobClient, Side } from "@polymarket/clob-client";
 import { Wallet } from "@ethersproject/wallet";
 import { Config, OrderBookMeta } from "./types";
 import { StateStore } from "./state";
@@ -79,8 +79,46 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function readApiKeyCredsFromEnv(config: Config): ApiKeyCreds | null {
+  if (config.polyApiKey && config.polyApiSecret && config.polyApiPassphrase) {
+    return {
+      key: config.polyApiKey,
+      secret: config.polyApiSecret,
+      passphrase: config.polyApiPassphrase,
+    };
+  }
+  if (config.polyApiKey || config.polyApiSecret || config.polyApiPassphrase) {
+    logger.warn("Partial POLY_API_* credentials provided; ignoring and attempting to derive API key.");
+  }
+  return null;
+}
+
 async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
-  const client = new ClobClient(config.clobHost, config.chainId, signer);
+  const envCreds = readApiKeyCredsFromEnv(config);
+  if (envCreds && !config.forceDeriveApiKey) {
+    logger.info("Using API key credentials from environment variables.", {
+      myUserAddress: config.myUserAddress,
+      funderAddress: config.funderAddress,
+      signatureType: config.signatureType,
+    });
+    return envCreds;
+  }
+
+  logger.info("Deriving API key", {
+    myUserAddress: config.myUserAddress,
+    funderAddress: config.funderAddress,
+    signatureType: config.signatureType,
+    forceDerive: config.forceDeriveApiKey,
+  });
+
+  const client = new ClobClient(
+    config.clobHost,
+    config.chainId,
+    signer,
+    undefined,
+    config.signatureType as any,
+    config.funderAddress
+  );
   let lastError: unknown;
   for (let attempt = 0; attempt < API_KEY_RETRY_DELAYS_MS.length + 1; attempt += 1) {
     try {

@@ -14,6 +14,7 @@ import { logger } from "./logger";
 
 const DEBUG_LOG_LIMIT = 3;
 let debugLogged = 0;
+let balanceCooldownUntilMs = 0;
 
 function todayKey(): string {
   const now = new Date();
@@ -34,13 +35,18 @@ function roundSize(value: number, precision: number): number {
   return Math.floor(value * factor) / factor;
 }
 
+// Market end fields are parsed from Gamma metadata (ISO string, unix seconds, or unix ms).
 function parseMarketEndMs(market: any): number | null {
   if (!market) return null;
   const candidates = [
+    market?.end_date_iso,
+    market?.endDateIso,
     market?.end_date,
     market?.endDate,
-    market?.close_time,
     market?.closeTime,
+    market?.close_time,
+    market?.closedTime,
+    market?.closed_time,
     market?.close_timestamp,
     market?.closeTimestamp,
     market?.resolution_time,
@@ -66,6 +72,30 @@ function parseMarketEndMs(market: any): number | null {
     }
   }
   return null;
+}
+
+function isBalanceCooldownActive(config: Config): boolean {
+  if (config.balanceErrorCooldownMs <= 0) return false;
+  return Date.now() < balanceCooldownUntilMs;
+}
+
+function maybeTriggerBalanceCooldown(config: Config, message?: string) {
+  if (!message) return;
+  const lower = message.toLowerCase();
+  const isBalanceError =
+    lower.includes("not enough balance") ||
+    lower.includes("insufficient balance") ||
+    lower.includes("insufficient funds") ||
+    lower.includes("allowance");
+  if (!isBalanceError) return;
+  const until = Date.now() + config.balanceErrorCooldownMs;
+  if (until > balanceCooldownUntilMs) {
+    balanceCooldownUntilMs = until;
+    logger.warn(
+      "Insufficient USDC balance or allowance. Check USDC.e balance and approval for trading. Cooling down until",
+      { until: new Date(until).toISOString() }
+    );
+  }
 }
 
 function extractErrorInfo(err: unknown): { message: string; status?: number | string } {
@@ -199,23 +229,94 @@ export async function mirrorTrade(
     return { status: "skipped", reason: tokenValidation.reason || "invalid tokenId" };
   }
 
+  if (trade.side === "BUY" && isBalanceCooldownActive(config)) {
+    logger.warn("trade skipped", {
+      reason: "balance/allowance cooldown",
+      conditionId: trade.conditionId,
+      tokenID: tokenId,
+      cooldownUntil: new Date(balanceCooldownUntilMs).toISOString(),
+    });
+    return { status: "skipped", reason: "balance/allowance cooldown" };
+  }
+
+  let buyOrderTtlSeconds: number | null = null;
   if (trade.side === "BUY") {
     try {
-      const market = await getMarketByConditionId(trade.conditionId);
-      const endMs = parseMarketEndMs(market);
-      if (endMs) {
-        const nowMs = Date.now();
-        const safetyMs = config.marketEndSafetySeconds * 1000;
-        if (nowMs >= endMs - safetyMs) {
-          return { status: "skipped", reason: "market expired/too close to end" };
-        }
-        const ttlMs = config.orderTtlSeconds * 1000;
-        if (nowMs + ttlMs >= endMs - safetyMs) {
-          return { status: "skipped", reason: "order TTL crosses market end" };
-        }
+      const { market, strict } = await getMarketByConditionId(trade.conditionId);
+      if (!market) {
+        logger.warn("trade skipped", {
+          reason: "market metadata unavailable",
+          conditionId: trade.conditionId,
+        });
+        return { status: "skipped", reason: "market metadata unavailable" };
       }
+
+      const marketTitle = market?.question || market?.title || market?.name || market?.slug;
+      const isClosed = Boolean(market?.closed);
+      const isArchived = Boolean(market?.archived);
+      const isActive = market?.active;
+      if (isClosed || isArchived || isActive === false) {
+        logger.warn("trade skipped", {
+          reason: "market closed/inactive",
+          conditionId: trade.conditionId,
+          marketTitle,
+          closed: isClosed,
+          archived: isArchived,
+          active: isActive,
+          strict,
+        });
+        return { status: "skipped", reason: "market closed/inactive" };
+      }
+
+      const endMs = parseMarketEndMs(market);
+      if (!endMs) {
+        logger.warn("trade skipped", {
+          reason: "missing market end time",
+          conditionId: trade.conditionId,
+          marketTitle,
+          closed: isClosed,
+          active: isActive,
+          strict,
+        });
+        return { status: "skipped", reason: "missing market end time" };
+      }
+
+      const nowMs = Date.now();
+      const safetyMs = config.marketEndSafetySeconds * 1000;
+      if (nowMs >= endMs - safetyMs) {
+        logger.warn("trade skipped", {
+          reason: "market expired/too close to end",
+          conditionId: trade.conditionId,
+          marketTitle,
+          nowMs,
+          marketEndMs: endMs,
+          safetyMs,
+        });
+        return { status: "skipped", reason: "market expired/too close to end" };
+      }
+
+      const maxTtlSeconds = Math.floor((endMs - nowMs) / 1000) - config.expirationSafetySeconds;
+      const ttlSeconds = Math.min(config.orderTtlSeconds, maxTtlSeconds);
+      if (ttlSeconds <= 1) {
+        logger.warn("trade skipped", {
+          reason: "order TTL crosses market end",
+          conditionId: trade.conditionId,
+          marketTitle,
+          nowMs,
+          marketEndMs: endMs,
+          safetyMs,
+          ttlSeconds,
+        });
+        return { status: "skipped", reason: "order TTL crosses market end" };
+      }
+      buyOrderTtlSeconds = ttlSeconds;
     } catch (err) {
       logger.warn("market end lookup failed", { conditionId: trade.conditionId, error: (err as Error).message });
+      logger.warn("trade skipped", {
+        reason: "market metadata unavailable",
+        conditionId: trade.conditionId,
+      });
+      return { status: "skipped", reason: "market metadata unavailable" };
     }
   }
 
@@ -321,9 +422,11 @@ export async function mirrorTrade(
   }
 
   const nowSeconds = Math.floor(Date.now() / 1000);
+  const ttlSeconds =
+    trade.side === "BUY" && buyOrderTtlSeconds !== null ? buyOrderTtlSeconds : config.orderTtlSeconds;
   const expiration = computeGtdExpirationSeconds(
     nowSeconds,
-    config.orderTtlSeconds,
+    ttlSeconds,
     config.expirationSafetySeconds
   );
   const userOrder = {
@@ -342,6 +445,7 @@ export async function mirrorTrade(
     state.addDailyNotional(todayKey(), notional);
     const orderId = resp?.orderID ?? resp?.orderId ?? resp?.id;
     if (resp?.success === false) {
+      maybeTriggerBalanceCooldown(config, resp?.message);
       return {
         status: "failed",
         reason: "order rejected",
@@ -369,6 +473,7 @@ export async function mirrorTrade(
         state.addDailyNotional(todayKey(), notional);
         const orderId = resp?.orderID ?? resp?.orderId ?? resp?.id;
         if (resp?.success === false) {
+          maybeTriggerBalanceCooldown(config, resp?.message);
           return {
             status: "failed",
             reason: "order rejected",
@@ -379,6 +484,7 @@ export async function mirrorTrade(
         return { status: "placed", reason: "order placed", orderId, notional, size: shares, limitPrice };
       } catch (fallbackErr) {
         const fallbackInfo = extractErrorInfo(fallbackErr);
+        maybeTriggerBalanceCooldown(config, fallbackInfo.message);
         return {
           status: "failed",
           reason: "order failed",
@@ -387,6 +493,7 @@ export async function mirrorTrade(
         };
       }
     }
+    maybeTriggerBalanceCooldown(config, info.message);
     return {
       status: "failed",
       reason: "order failed",
