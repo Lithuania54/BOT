@@ -21,11 +21,22 @@ export function selectLeaders(scores: TraderScore[], config: Config, state: Stat
       .slice(0, Math.max(1, config.topK));
 
     const totalPositive = selected.reduce((sum, s) => sum + (s.score > 0 ? s.score : 0), 0);
+    if (selected.length === 0 || totalPositive <= 0) {
+      for (const prevWallet of prev) {
+        state.setSwitchedAway(prevWallet, now);
+      }
+      state.setTopKState([]);
+      return {
+        mode: "TOPK",
+        leaders: [],
+        reason: selected.length === 0 ? "no eligible leaders" : "no positive scores",
+      };
+    }
     const leaders = selected.map((s) => ({
       proxyWallet: s.proxyWallet,
       displayName: s.displayName,
       score: s.score,
-      weight: totalPositive > 0 ? Math.max(0, s.score) / totalPositive : 1 / selected.length,
+      weight: Math.max(0, s.score) / totalPositive,
     }));
 
     const selectedWallets = leaders.map((l) => l.proxyWallet);

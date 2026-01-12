@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import { Config, FollowMode } from "./types";
+import { logger } from "./logger";
 
 dotenv.config();
 
@@ -37,6 +38,26 @@ function requireString(name: string): string {
   const raw = process.env[name];
   if (!raw) throw new Error(`Missing ${name}`);
   return raw;
+}
+
+function parseRpcUrl(): string | undefined {
+  const raw = process.env.RPC_URL;
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || /\s/.test(trimmed)) {
+    logger.error("RPC_URL is invalid (contains whitespace). Auto-redeem will be disabled.", { rpcUrl: raw });
+    return undefined;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (!parsed.protocol.startsWith("http")) {
+      throw new Error("Invalid protocol");
+    }
+    return trimmed;
+  } catch {
+    logger.error("RPC_URL is invalid (not a URL). Auto-redeem will be disabled.", { rpcUrl: raw });
+    return undefined;
+  }
 }
 
 export function loadConfig(): Config {
@@ -78,6 +99,18 @@ export function loadConfig(): Config {
     funderAddress: process.env.FUNDER_ADDRESS,
     maxDailyUsdc: process.env.MAX_DAILY_USDC ? parseNumber("MAX_DAILY_USDC") : undefined,
     openPnlPenaltyFactor: parseNumber("OPEN_PNL_PENALTY_FACTOR", 0.25),
+    orderTtlSeconds: parseNumber("ORDER_TTL_SECONDS", 60),
+    expirationSafetySeconds: parseNumber("EXPIRATION_SAFETY_SECONDS", 60),
+    marketEndSafetySeconds: parseNumber("MARKET_END_SAFETY_SECONDS", 120),
+    balanceErrorCooldownMs: parseNumber("BALANCE_ERROR_COOLDOWN_MS", 900000),
+    autoRedeemEnabled: parseBoolean("AUTO_REDEEM_ENABLED", false),
+    redeemPollMs: parseNumber("REDEEM_POLL_MS", 300000),
+    redeemCooldownMs: parseNumber("REDEEM_COOLDOWN_MS", 3600000),
+    rpcUrl: parseRpcUrl(),
+    polyApiKey: process.env.POLY_API_KEY,
+    polyApiSecret: process.env.POLY_API_SECRET,
+    polyApiPassphrase: process.env.POLY_API_PASSPHRASE,
+    forceDeriveApiKey: parseBoolean("FORCE_DERIVE_API_KEY", false),
   };
 
   if (!config.dryRun) {

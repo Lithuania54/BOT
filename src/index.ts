@@ -3,7 +3,8 @@ import { checkGeoblock } from "./api/geoblock";
 import { resolveTargetToProxyWallet } from "./api/gamma";
 import { fetchTrades, normalizeTrade } from "./api/dataApi";
 import { initClobClients } from "./clob";
-import { mirrorTrade } from "./mirror";
+import { buildTradeKey, mirrorTrade } from "./mirror";
+import { startAutoRedeemLoop } from "./redeem";
 import { StateStore } from "./state";
 import { computeScores } from "./scoring";
 import { selectLeaders } from "./selector";
@@ -13,10 +14,6 @@ import { createLimiter } from "./limiter";
 
 const TRADE_LIMIT = 1000;
 const MAX_PAGES = 5;
-
-function tradeKey(trade: Trade): string {
-  return `${trade.proxyWallet}:${trade.transactionHash}:${trade.conditionId}:${trade.outcomeIndex}:${trade.side}:${trade.sizeRaw}:${trade.priceRaw}:${trade.timestampMs}`;
-}
 
 function shouldCopyTrade(selection: LeaderSelection, trade: Trade): { copy: boolean; weight: number } {
   if (selection.mode === "LEADER") {
@@ -85,10 +82,23 @@ async function run() {
     process.exit(1);
   }
 
-  const { publicClient, tradingClient } = await initClobClients(config);
+  const { publicClient, tradingClient: initialTradingClient, startTradingClientRetry } = await initClobClients(config);
+  let tradingClient = initialTradingClient;
+  if (startTradingClientRetry) {
+    startTradingClientRetry((client) => {
+      tradingClient = client;
+    });
+  }
+
+  startAutoRedeemLoop({
+    config,
+    state,
+    publicClient,
+  });
 
   const resolvedTargets = await resolveTargets(config.targets, state);
   let selection: LeaderSelection = { mode: config.followMode, leaders: [], reason: "not evaluated" };
+  const failureReasons = new Map<string, string>();
 
   async function evaluateSelection() {
     const scores = await computeScores(resolvedTargets, config, state);
@@ -119,37 +129,73 @@ async function run() {
     try {
       const tasks = resolvedTargets.map((target) =>
         pollLimit(async () => {
-          const { trades, newestTimestamp } = await fetchNewTradesForTarget(target, state);
-          if (!trades.length) return;
-          for (const trade of trades) {
-            const { copy, weight } = shouldCopyTrade(selection, trade);
-            if (!copy) continue;
-            const key = tradeKey(trade);
-            if (state.hasProcessed(key)) continue;
+          try {
+            const { trades, newestTimestamp } = await fetchNewTradesForTarget(target, state);
+            if (!trades.length) return;
+            for (const trade of trades) {
+              const { copy, weight } = shouldCopyTrade(selection, trade);
+              if (!copy) continue;
+              const keyResult = buildTradeKey(trade);
+              if (!keyResult.key) {
+                if (keyResult.persistKey && state.hasProcessed(keyResult.persistKey)) {
+                  continue;
+                }
+                if (keyResult.persistKey) {
+                  state.markProcessed(keyResult.persistKey, keyResult.reason || "missing required trade fields");
+                }
+                continue;
+              }
 
-            try {
-              const result = await mirrorTrade(trade, weight, config, state, publicClient, tradingClient);
-              state.markProcessed(key, result.reason);
-              if (result.status !== "skipped") {
-                state.setLastTrade(key, trade.timestampMs);
-                logger.info("trade mirrored", {
+              const key = keyResult.key;
+              if (state.hasProcessed(key)) continue;
+
+              try {
+                const result = await mirrorTrade(trade, weight, config, state, publicClient, tradingClient);
+                state.markProcessed(key, result.reason);
+                if (result.status === "failed") {
+                  failureReasons.set(key, result.errorMessage || result.reason);
+                }
+                if (result.status === "placed" || result.status === "dry_run") {
+                  state.setLastTrade(key, trade.timestampMs);
+                }
+                const logPayload = {
                   proxyWallet: trade.proxyWallet,
                   conditionId: trade.conditionId,
                   outcomeIndex: trade.outcomeIndex,
                   side: trade.side,
+                  reason: result.reason,
                   size: result.size,
                   limitPrice: result.limitPrice,
                   notional: result.notional,
                   status: result.status,
+                  orderId: result.orderId,
+                  error: result.errorMessage,
+                  errorStatus: result.errorStatus,
+                };
+                if (result.status === "failed") {
+                  logger.warn("trade mirrored", logPayload);
+                } else {
+                  logger.info("trade mirrored", logPayload);
+                }
+              } catch (err) {
+                const message = (err as Error).message || "unknown error";
+                failureReasons.set(key, message);
+                state.markProcessed(key, "mirror failed");
+                logger.warn("trade mirrored", {
+                  proxyWallet: trade.proxyWallet,
+                  conditionId: trade.conditionId,
+                  outcomeIndex: trade.outcomeIndex,
+                  side: trade.side,
+                  status: "failed",
+                  reason: "mirror failed",
+                  error: message,
                 });
-              } else {
-                logger.info("trade skipped", { key, reason: result.reason });
               }
-            } catch (err) {
-              logger.error("mirror failed", { key, error: (err as Error).message });
             }
+            state.setLastSeen(target.proxyWallet, newestTimestamp);
+          } catch (err) {
+            logger.error("trade poll failed", { proxyWallet: target.proxyWallet, error: (err as Error).message });
           }
-          state.setLastSeen(target.proxyWallet, newestTimestamp);
         })
       );
       await Promise.all(tasks);

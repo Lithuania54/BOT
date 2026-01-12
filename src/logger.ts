@@ -7,7 +7,17 @@ const levelOrder: Record<LogLevel, number> = {
   error: 40,
 };
 
-const currentLevel: LogLevel = (process.env.LOG_LEVEL as LogLevel) || "info";
+function normalizeLogLevel(raw: string | undefined): LogLevel {
+  if (!raw) return "info";
+  const last = raw.split(/[,\s]+/).filter(Boolean).pop();
+  const normalized = (last || "").toLowerCase();
+  if (normalized === "debug" || normalized === "info" || normalized === "warn" || normalized === "error") {
+    return normalized as LogLevel;
+  }
+  return "info";
+}
+
+const currentLevel: LogLevel = normalizeLogLevel(process.env.LOG_LEVEL);
 
 function shouldLog(level: LogLevel): boolean {
   return levelOrder[level] >= levelOrder[currentLevel];

@@ -91,3 +91,33 @@ export async function getClobTokenIdsForCondition(
   state.setConditionTokenIds(conditionId, tokenIds);
   return tokenIds;
 }
+
+async function fetchMarket(conditionId: string, params: Record<string, string>): Promise<any | null> {
+  const url = `${GAMMA_BASE}/markets?${new URLSearchParams(params).toString()}`;
+  const data = await fetchJson<any>(url);
+  const markets = Array.isArray(data) ? data : data?.markets || data?.data || [];
+  return markets[0] || null;
+}
+
+export async function getMarketByConditionId(
+  conditionId: string
+): Promise<{ market: any | null; strict: boolean }> {
+  const strictParams = {
+    condition_ids: conditionId,
+    limit: "1",
+    offset: "0",
+    active: "true",
+    closed: "false",
+    archived: "false",
+  };
+  const strictMarket = await fetchMarket(conditionId, strictParams);
+  if (strictMarket) return { market: strictMarket, strict: true };
+
+  const fallbackParams = {
+    condition_ids: conditionId,
+    limit: "1",
+    offset: "0",
+  };
+  const fallbackMarket = await fetchMarket(conditionId, fallbackParams);
+  return { market: fallbackMarket, strict: false };
+}
