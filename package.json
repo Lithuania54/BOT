@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test:config": "tsx scripts/config-parse-test.ts",
+    "test:filters": "tsx scripts/filters-test.ts",
     "show:approval": "tsx scripts/show-approval.ts"
   },
   "dependencies": {

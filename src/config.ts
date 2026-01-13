@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import { Wallet } from "ethers";
 import { Config, FollowMode } from "./types";
+import { normalizeCategoryToken } from "./marketFilter";
 import { logger } from "./logger";
 
 dotenv.config();
@@ -59,6 +60,12 @@ function parseBoolean(name: string, fallback: boolean): boolean {
   throw new Error(`Invalid boolean for ${name}: ${raw}`);
 }
 
+function parseNumberValue(name: string, raw: string): number {
+  const value = Number(raw);
+  if (Number.isNaN(value)) throw new Error(`Invalid number for ${name}: ${raw}`);
+  return value;
+}
+
 function requireString(name: string): string {
   const raw = env(name);
   if (!raw) throw new Error(`Missing ${name}`);
@@ -73,6 +80,46 @@ export function parseMaxDailyUsdc(raw: string | undefined): number {
     throw new Error(`Invalid number for MAX_DAILY_USDC: ${normalized}`);
   }
   return value;
+}
+
+function parseMinAllowanceUsdc(): number {
+  const raw = env("MIN_ALLOWANCE_USDC");
+  if (raw !== undefined && raw !== "") {
+    const value = parseNumberValue("MIN_ALLOWANCE_USDC", raw);
+    if (value < 0) throw new Error(`MIN_ALLOWANCE_USDC must be >= 0. Got: ${raw}`);
+    return value;
+  }
+  const legacy = env("ALLOWANCE_THRESHOLD_USDC");
+  if (legacy !== undefined && legacy !== "") {
+    const value = parseNumberValue("ALLOWANCE_THRESHOLD_USDC", legacy);
+    if (value < 0) throw new Error(`ALLOWANCE_THRESHOLD_USDC must be >= 0. Got: ${legacy}`);
+    return value;
+  }
+  return 50;
+}
+
+function parseApproveAmountUsdc(): string {
+  const raw = env("APPROVE_AMOUNT_USDC");
+  if (raw === undefined || raw === "") return "1000";
+  const normalized = raw.trim();
+  const lower = normalized.toLowerCase();
+  if (lower === "unlimited" || lower === "max" || lower === "maxuint256") {
+    return "unlimited";
+  }
+  const value = parseNumberValue("APPROVE_AMOUNT_USDC", normalized);
+  if (value <= 0) {
+    throw new Error(`APPROVE_AMOUNT_USDC must be > 0 or 'unlimited'. Got: ${normalized}`);
+  }
+  return normalized;
+}
+
+function parseCsvList(name: string, fallback: string[]): string[] {
+  const raw = env(name);
+  if (raw === undefined || raw === "") return fallback;
+  return raw
+    .split(",")
+    .map((entry) => normalizeCategoryToken(entry))
+    .filter(Boolean);
 }
 
 function parseUrlValue(name: string, raw: string | undefined): string | undefined {
@@ -231,7 +278,10 @@ export function loadConfig(): Config {
     balanceErrorCooldownMs: parseNumber("BALANCE_ERROR_COOLDOWN_MS", 900000),
     noOrderLivenessMs: parseNumber("NO_ORDER_LIVENESS_MS", 900000),
     autoApprove: parseBoolean("AUTO_APPROVE", false),
-    allowanceThresholdUsdc: parseNumber("ALLOWANCE_THRESHOLD_USDC", 0),
+    approveAmountUsdc: parseApproveAmountUsdc(),
+    minAllowanceUsdc: parseMinAllowanceUsdc(),
+    allowedCategories: parseCsvList("ALLOWED_CATEGORIES", ["crypto", "finance", "politics", "tech", "other"]),
+    disallowedCategories: parseCsvList("DISALLOWED_CATEGORIES", ["sports"]),
     autoRedeemEnabled: parseBoolean("AUTO_REDEEM_ENABLED", false),
     redeemPollMs: parseNumber("REDEEM_POLL_MS", 300000),
     redeemCooldownMs: parseNumber("REDEEM_COOLDOWN_MS", 3600000),

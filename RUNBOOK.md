@@ -16,10 +16,10 @@
 - Inspect skip reasons on trades:
   - Log line: `trade skipped` with `reasonCode` (e.g. `SKIP_MARKET_EXPIRED`, `SKIP_MIN_SIZE`, `SKIP_DAILY_CAP`, `SKIP_ALLOWANCE_LOW`).
 - Verify collateral status:
-  - Log line: `allowance check` shows `balance`, `allowance`, `allowanceToken`, and `allowanceSpender`.
+  - Log line: `allowance status` shows `owner`, `allowance`, and `required`.
   - `USDC allowance too low; approval required before trading` means the bot is in trading-disabled mode until approval.
   - `USDC allowance sufficient; trading re-enabled` indicates trading resumes automatically.
-  - `AUTO_APPROVE disabled for proxy wallets...` indicates approval must be done in the Polymarket UI.
+  - `Approve USDC spending for spender ... on token ... in Polymarket UI.` indicates approval must be done in the Polymarket UI.
   - `npm run show:approval` prints funder/token/spender/allowance with a reminder about proxy approvals.
   - If you see `SKIP_RESERVED_OPEN_ORDERS`, cancel open BUY orders to free collateral.
 - Look for promoted error logs:

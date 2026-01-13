@@ -4,6 +4,14 @@
 - Preflight checks fail (auth, funder/signature mismatch, balance/allowance, or collateral reserved in open orders).
 - Market metadata is missing or indicates the market is closed/expired/too close to end.
 - Safety limits are hit (min size, daily cap, max per-trade size, or balance cooldown after failures).
+- Market filters skip disallowed categories (e.g., sports).
+
+## Allowance + market filter defaults
+- `AUTO_APPROVE=false`: disable automatic on-chain approvals by default (EOA only).
+- `APPROVE_AMOUNT_USDC=1000`: approve 1000 USDC (use `unlimited` for MaxUint256).
+- `MIN_ALLOWANCE_USDC=50`: disable trading if allowance is below this.
+- `ALLOWED_CATEGORIES=crypto,finance,politics,tech,other`: allowlist for market categories/tags.
+- `DISALLOWED_CATEGORIES=sports`: block sports markets.
 
 ## Trade cursor persistence
 - The bot persists the newest seen leader trade timestamp per proxy wallet to `MIRROR_CURSOR_FILE` (default `.pm_mirror_cursor.json`) to avoid replaying historical trades after restarts.
@@ -20,6 +28,8 @@
 - `SKIP_MARKET_END_UNKNOWN`: could not determine end time; BUY skipped for safety.
 - `SKIP_MARKET_EXPIRED`: end time is past or too close for safety window.
 - `SKIP_ORDER_TTL_CROSSES_END`: order TTL would extend past end time.
+- `SKIP_CATEGORY_SPORTS`: market is categorized/tagged as sports or matches sports patterns.
+- `SKIP_CATEGORY_NOT_ALLOWED`: category exists but is not in `ALLOWED_CATEGORIES`.
 - `SKIP_INVALID_EXEC_PRICE`: order book empty or invalid executable price.
 - `SKIP_INVALID_TRADE_NOTIONAL`: source trade notional <= 0.
 - `SKIP_NON_POSITIVE_WEIGHT`: trader weight <= 0.

@@ -3,6 +3,7 @@ import { Config, MirrorResult, Trade } from "./types";
 import { StateStore } from "./state";
 import { fetchPositions } from "./api/dataApi";
 import { getClobTokenIdsForCondition, getMarketByConditionId } from "./api/gamma";
+import { AllowanceManager } from "./allowance";
 import {
   computeGtdExpirationSeconds,
   getExecutablePriceFromBook,
@@ -11,6 +12,7 @@ import {
   roundPriceToTick,
 } from "./clob";
 import { logger } from "./logger";
+import { evaluateMarketCategory, extractMarketTitle } from "./marketFilter";
 import {
   calculateAvailableUsdcMicro,
   computeReservedUsdcMicro,
@@ -593,7 +595,8 @@ export async function mirrorTrade(
   config: Config,
   state: StateStore,
   publicClient: ClobClient,
-  tradingClient?: ClobClient
+  tradingClient?: ClobClient,
+  allowanceManager?: AllowanceManager
 ): Promise<MirrorResult> {
   const missingFields = getMissingTradeFields(trade);
   if (missingFields.length > 0) {
@@ -628,19 +631,38 @@ export async function mirrorTrade(
     return { status: "skipped", reason: "balance/allowance cooldown" };
   }
 
+  let market: any | null = null;
+  let strictMarket = false;
+  let marketTitle: string | undefined;
+
   let buyOrderTtlSeconds: number | null = null;
   if (trade.side === "BUY") {
     try {
-      const { market, strict } = await getMarketByConditionId(trade.conditionId);
+      const { market: fetchedMarket, strict } = await getMarketByConditionId(trade.conditionId);
+      market = fetchedMarket;
+      strictMarket = strict;
       if (!market) {
         logDecision("SKIP_MARKET_METADATA_UNAVAILABLE", trade, {
           tokenID: tokenId,
-          strict,
+          strict: strictMarket,
         });
         return { status: "skipped", reason: "market metadata unavailable" };
       }
 
-      const marketTitle = market?.question || market?.title || market?.name || market?.slug;
+      marketTitle = extractMarketTitle(market);
+      const categoryDecision = evaluateMarketCategory(market, config);
+      if (!categoryDecision.allowed) {
+        logDecision(categoryDecision.reasonCode || "SKIP_CATEGORY_SPORTS", trade, {
+          tokenID: tokenId,
+          marketTitle: categoryDecision.title,
+          categories: categoryDecision.categories,
+          matched: categoryDecision.matched,
+          matchSource: categoryDecision.matchSource,
+          strict: strictMarket,
+        });
+        return { status: "skipped", reason: categoryDecision.reason || "market category disallowed" };
+      }
+
       const isClosed = Boolean(market?.closed);
       const isArchived = Boolean(market?.archived);
       const isActive = market?.active;
@@ -651,7 +673,7 @@ export async function mirrorTrade(
           closed: isClosed,
           archived: isArchived,
           active: isActive,
-          strict,
+          strict: strictMarket,
         });
         return { status: "skipped", reason: "market closed/inactive" };
       }
@@ -663,7 +685,7 @@ export async function mirrorTrade(
           marketTitle,
           closed: isClosed,
           active: isActive,
-          strict,
+          strict: strictMarket,
         });
         return { status: "skipped", reason: "missing market end time" };
       }
@@ -703,6 +725,42 @@ export async function mirrorTrade(
         status: info.status,
       });
       return { status: "skipped", reason: "market metadata unavailable" };
+    }
+  } else {
+    try {
+      const { market: fetchedMarket, strict } = await getMarketByConditionId(trade.conditionId);
+      market = fetchedMarket;
+      strictMarket = strict;
+    } catch (err) {
+      const info = extractErrorInfo(err);
+      logDecision("SKIP_MARKET_METADATA_UNAVAILABLE", trade, {
+        tokenID: tokenId,
+        error: info.message,
+        status: info.status,
+      });
+      return { status: "skipped", reason: "market metadata unavailable" };
+    }
+
+    if (!market) {
+      logDecision("SKIP_MARKET_METADATA_UNAVAILABLE", trade, {
+        tokenID: tokenId,
+        strict: strictMarket,
+      });
+      return { status: "skipped", reason: "market metadata unavailable" };
+    }
+
+    marketTitle = extractMarketTitle(market);
+    const categoryDecision = evaluateMarketCategory(market, config);
+    if (!categoryDecision.allowed) {
+      logDecision(categoryDecision.reasonCode || "SKIP_CATEGORY_SPORTS", trade, {
+        tokenID: tokenId,
+        marketTitle: categoryDecision.title,
+        categories: categoryDecision.categories,
+        matched: categoryDecision.matched,
+        matchSource: categoryDecision.matchSource,
+        strict: strictMarket,
+      });
+      return { status: "skipped", reason: categoryDecision.reason || "market category disallowed" };
     }
   }
 
@@ -826,6 +884,33 @@ export async function mirrorTrade(
         maxDailyUsdc: config.maxDailyUsdc,
       });
       return { status: "skipped", reason: "daily cap reached" };
+    }
+  }
+
+  if (trade.side === "BUY" && !config.dryRun && tradingClient && allowanceManager) {
+    try {
+      const allowanceStatus = await allowanceManager.ensureAllowance({
+        reason: "pre-trade",
+        requiredNotionalUsdc: notional,
+      });
+      if (!allowanceStatus.ok) {
+        logDecision("SKIP_ALLOWANCE_LOW", trade, {
+          tokenID: tokenId,
+          owner: allowanceStatus.owner,
+          allowance: formatUsdcMicro(allowanceStatus.allowanceMicro),
+          required: formatUsdcMicro(allowanceStatus.requiredMicro),
+          reason: allowanceStatus.reason,
+        });
+        return { status: "skipped", reason: "allowance too low" };
+      }
+    } catch (err) {
+      const info = extractErrorInfo(err);
+      logDecision("SKIP_PREFLIGHT_ERROR", trade, {
+        tokenID: tokenId,
+        error: info.message,
+        status: info.status,
+      });
+      return { status: "skipped", reason: "allowance check failed" };
     }
   }
 

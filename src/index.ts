@@ -1,6 +1,3 @@
-import { AssetType } from "@polymarket/clob-client";
-import { Contract, Wallet, constants } from "ethers";
-import { JsonRpcProvider } from "@ethersproject/providers";
 import { loadConfig } from "./config";
 import { checkGeoblock } from "./api/geoblock";
 import { resolveTargetToProxyWallet } from "./api/gamma";
@@ -14,36 +11,12 @@ import { selectLeaders } from "./selector";
 import { LeaderSelection, ResolvedTarget, Trade } from "./types";
 import { logger } from "./logger";
 import { createLimiter } from "./limiter";
-import { formatUsdcMicro, parseUsdcToMicro } from "./preflight";
+import { formatUsdcMicro } from "./preflight";
 import { MirrorCursorStore } from "./cursor";
+import { AllowanceManager } from "./allowance";
 
 const TRADE_LIMIT = 1000;
 const MAX_PAGES = 5;
-const USDCe_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-const CTF_SPENDER_ADDRESS = "0x4d97dcd97ec945f40cf65f87097ace5ea0476045";
-// Module-level guard avoids TDZ if checkAllowance is invoked before local declarations.
-let allowanceCheckInFlight: Promise<void> | null = null;
-
-const ERC20_ABI = [
-  "function approve(address spender, uint256 amount) returns (bool)",
-  "function allowance(address owner, address spender) view returns (uint256)",
-];
-
-function formatAllowanceDiagnostic(allowanceMicro: bigint, thresholdMicro: bigint) {
-  return {
-    allowance: formatUsdcMicro(allowanceMicro),
-    threshold: formatUsdcMicro(thresholdMicro),
-    token: USDCe_ADDRESS,
-    spender: CTF_SPENDER_ADDRESS,
-  };
-}
-
-function getAllowanceOwner(config: { signatureType: number; funderAddress?: string; myUserAddress: string }): string {
-  if (config.signatureType === 1 || config.signatureType === 2) {
-    return config.funderAddress || config.myUserAddress;
-  }
-  return config.myUserAddress;
-}
 
 function shouldCopyTrade(selection: LeaderSelection, trade: Trade): { copy: boolean; weight: number } {
   if (selection.mode === "LEADER") {
@@ -130,107 +103,36 @@ async function run() {
     signatureType: config.signatureType,
   });
 
+  const allowanceManager = new AllowanceManager(config);
   let tradingEnabled = true;
-  let allowanceLogged = false;
-  let lastAllowanceCheckMs = 0;
-  let lastApproveAttemptMs = 0;
+  let lastDisabledLogMs = 0;
   const allowanceCheckIntervalMs = Math.max(60000, config.pollMs);
 
-  async function checkAllowance(reason: "startup" | "interval"): Promise<void> {
-    if (allowanceCheckInFlight) return allowanceCheckInFlight;
-    allowanceCheckInFlight = (async () => {
-      if (config.dryRun || !tradingClient) return;
-      try {
-        const balance = await tradingClient.getBalanceAllowance({ asset_type: AssetType.COLLATERAL });
-        const balanceMicro = parseUsdcToMicro(balance?.balance);
-        const allowanceMicro = parseUsdcToMicro(balance?.allowance);
-        const thresholdMicro = parseUsdcToMicro(config.allowanceThresholdUsdc);
-        const funderOwner = getAllowanceOwner(config);
-
-        logger.info("allowance check", {
-          reason,
-          funderAddress: funderOwner,
-          balance: formatUsdcMicro(balanceMicro),
-          allowance: formatUsdcMicro(allowanceMicro),
-          allowanceToken: USDCe_ADDRESS,
-          allowanceSpender: CTF_SPENDER_ADDRESS,
-        });
-
-        if (thresholdMicro > 0n && allowanceMicro < thresholdMicro) {
-          tradingEnabled = false;
-          const diagnostic = {
-            ...formatAllowanceDiagnostic(allowanceMicro, thresholdMicro),
-            funderAddress: funderOwner,
-            signatureType: config.signatureType,
-          };
-
-          if (config.autoApprove) {
-            if (funderOwner !== config.myUserAddress) {
-              if (!allowanceLogged) {
-                logger.error(
-                  "AUTO_APPROVE disabled for proxy wallets. Approve USDC.e in the Polymarket UI for FUNDER_ADDRESS.",
-                  diagnostic
-                );
-                allowanceLogged = true;
-              }
-            } else if (!config.rpcUrl) {
-              if (!allowanceLogged) {
-                logger.error("AUTO_APPROVE requested but RPC_URL is missing", diagnostic);
-                allowanceLogged = true;
-              }
-            } else if (config.signatureType !== 0) {
-              if (!allowanceLogged) {
-                logger.error("AUTO_APPROVE only supported for SIGNATURE_TYPE=0 (EOA)", diagnostic);
-                allowanceLogged = true;
-              }
-            } else {
-              const now = Date.now();
-              if (now - lastApproveAttemptMs > 5 * 60 * 1000) {
-                lastApproveAttemptMs = now;
-                const provider = new JsonRpcProvider(config.rpcUrl);
-                const signer = new Wallet(config.privateKey as string, provider);
-                const token = new Contract(USDCe_ADDRESS, ERC20_ABI, signer);
-
-                logger.info("submitting USDC approval", {
-                  token: USDCe_ADDRESS,
-                  spender: CTF_SPENDER_ADDRESS,
-                });
-                const tx = await token.approve(CTF_SPENDER_ADDRESS, constants.MaxUint256);
-                logger.info("approval submitted", { hash: tx.hash, token: USDCe_ADDRESS, spender: CTF_SPENDER_ADDRESS });
-                const receipt = await tx.wait();
-                logger.info("approval confirmed", {
-                  hash: receipt?.transactionHash,
-                  blockNumber: receipt?.blockNumber,
-                });
-              }
-            }
-          } else if (!allowanceLogged) {
-            logger.error("USDC allowance too low; approval required before trading", diagnostic);
-            logger.error(
-              "Approve USDC.e for trading in the Polymarket UI (proxy wallets), or set AUTO_APPROVE=true for EOA."
-            );
-            allowanceLogged = true;
-          }
-        } else if (!tradingEnabled) {
-          tradingEnabled = true;
-          allowanceLogged = false;
-          logger.info("USDC allowance sufficient; trading re-enabled", {
-            funderAddress: funderOwner,
-            allowance: formatUsdcMicro(allowanceMicro),
-          });
-        }
-      } catch (err) {
-        logger.error("allowance check failed", { error: (err as Error).message });
-      } finally {
-        lastAllowanceCheckMs = Date.now();
-      }
-    })().finally(() => {
-      allowanceCheckInFlight = null;
-    });
-    return allowanceCheckInFlight;
+  function updateTradingEnabled(status: { ok: boolean; owner: string; allowanceMicro: bigint }) {
+    if (config.dryRun) {
+      tradingEnabled = true;
+      return;
+    }
+    const wasEnabled = tradingEnabled;
+    tradingEnabled = status.ok;
+    if (status.ok && !wasEnabled) {
+      logger.info("USDC allowance sufficient; trading re-enabled", {
+        owner: status.owner,
+        allowance: formatUsdcMicro(status.allowanceMicro),
+      });
+    }
   }
 
-  await checkAllowance("startup");
+  const startupAllowance = await allowanceManager.ensureAllowance({ reason: "startup" });
+  if (!config.dryRun) {
+    logger.info("allowance status", {
+      owner: startupAllowance.owner,
+      allowance: formatUsdcMicro(startupAllowance.allowanceMicro),
+      required: formatUsdcMicro(startupAllowance.requiredMicro),
+      ok: startupAllowance.ok,
+    });
+  }
+  updateTradingEnabled(startupAllowance);
 
   startAutoRedeemLoop({
     config,
@@ -287,7 +189,6 @@ async function run() {
             for (const trade of trades) {
               const { copy, weight } = shouldCopyTrade(selection, trade);
               if (!copy) continue;
-              lastSignalMs = Date.now();
               const keyResult = buildTradeKey(trade);
               if (!keyResult.key) {
                 if (keyResult.persistKey && state.hasProcessed(keyResult.persistKey)) {
@@ -314,10 +215,24 @@ async function run() {
               }
 
               try {
-                const result = await mirrorTrade(trade, weight, config, state, publicClient, tradingClient);
+                const result = await mirrorTrade(
+                  trade,
+                  weight,
+                  config,
+                  state,
+                  publicClient,
+                  tradingClient,
+                  allowanceManager
+                );
                 state.markProcessed(key, result.reason);
+                if (result.status === "skipped" && result.reason === "allowance too low") {
+                  tradingEnabled = false;
+                }
                 if (result.status === "failed") {
                   failureReasons.set(key, result.errorMessage || result.reason);
+                }
+                if (result.status !== "skipped") {
+                  lastSignalMs = Date.now();
                 }
                 if (result.status === "placed" || result.status === "dry_run") {
                   state.setLastTrade(key, trade.timestampMs);
@@ -369,11 +284,13 @@ async function run() {
       await Promise.all(tasks);
       await cursorStore.persist();
     } finally {
-      if (skippedDueToDisabled > 0) {
+      const now = Date.now();
+      if (skippedDueToDisabled > 0 && now - lastDisabledLogMs > allowanceCheckIntervalMs) {
         logger.warn("trading disabled: skipping order placement", {
           reason: "allowance too low",
           skippedTrades: skippedDueToDisabled,
         });
+        lastDisabledLogMs = now;
       }
       polling = false;
     }
@@ -389,9 +306,10 @@ async function run() {
   await pollTrades();
   startPollingLoop();
   setInterval(() => {
-    checkAllowance("interval").catch((err) =>
-      logger.error("allowance check failed", { error: (err as Error).message })
-    );
+    allowanceManager
+      .ensureAllowance({ reason: "interval" })
+      .then(updateTradingEnabled)
+      .catch((err) => logger.error("allowance check failed", { error: (err as Error).message }));
   }, allowanceCheckIntervalMs);
 
   setInterval(() => {

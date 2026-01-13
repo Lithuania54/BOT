@@ -32,7 +32,10 @@ export interface Config {
   balanceErrorCooldownMs: number;
   noOrderLivenessMs: number;
   autoApprove: boolean;
-  allowanceThresholdUsdc: number;
+  approveAmountUsdc: string;
+  minAllowanceUsdc: number;
+  allowedCategories: string[];
+  disallowedCategories: string[];
   autoRedeemEnabled: boolean;
   redeemPollMs: number;
   redeemCooldownMs: number;
