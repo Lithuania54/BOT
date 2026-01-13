@@ -274,7 +274,7 @@ export function loadConfig(): Config {
     openPnlPenaltyFactor: parseNumber("OPEN_PNL_PENALTY_FACTOR", 0.25),
     orderTtlSeconds: parseNumber("ORDER_TTL_SECONDS", 60),
     expirationSafetySeconds: parseNumber("EXPIRATION_SAFETY_SECONDS", 60),
-    marketEndSafetySeconds: parseNumber("MARKET_END_SAFETY_SECONDS", 120),
+    marketEndSafetySeconds: parseNumber("MARKET_END_SAFETY_SECONDS", 300),
     balanceErrorCooldownMs: parseNumber("BALANCE_ERROR_COOLDOWN_MS", 900000),
     noOrderLivenessMs: parseNumber("NO_ORDER_LIVENESS_MS", 900000),
     autoApprove: parseBoolean("AUTO_APPROVE", false),

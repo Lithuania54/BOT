@@ -86,43 +86,94 @@ function logExpiredDecision(trade: Trade, extra?: Record<string, unknown>) {
   logger.warn("trade skipped", payload);
 }
 
-// Market end fields are parsed from Gamma metadata (ISO string, unix seconds, or unix ms).
-function parseMarketEndMs(market: any): number | null {
-  if (!market) return null;
-  const candidates = [
-    market?.end_date_iso,
-    market?.endDateIso,
-    market?.end_date,
-    market?.endDate,
-    market?.closeTime,
-    market?.close_time,
-    market?.closedTime,
-    market?.closed_time,
-    market?.close_timestamp,
-    market?.closeTimestamp,
-    market?.resolution_time,
-    market?.resolutionTime,
-    market?.resolve_time,
-    market?.resolveTime,
-    market?.end_time,
-    market?.endTime,
-  ];
+type MarketEndParse = {
+  endMs: number | null;
+  source?: string;
+  normalized?: string;
+  raw: Record<string, unknown>;
+};
 
-  for (const candidate of candidates) {
-    if (candidate === undefined || candidate === null) continue;
-    if (typeof candidate === "number") {
-      return candidate < 1e12 ? candidate * 1000 : candidate;
+function hasTimeComponent(value: string): boolean {
+  return /\d{2}:\d{2}/.test(value);
+}
+
+function normalizeIsoTimestamp(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (!hasTimeComponent(trimmed)) return null;
+  let normalized = trimmed;
+  if (!normalized.includes("T") && normalized.includes(" ")) {
+    normalized = normalized.replace(" ", "T");
+  }
+  const hasTimezone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(normalized);
+  if (!hasTimezone) {
+    normalized = `${normalized}Z`;
+  }
+  return normalized;
+}
+
+function parseMarketEndCandidate(value: unknown): { endMs: number; normalized?: string } | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return { endMs: value < 1e12 ? value * 1000 : value };
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+    const numeric = Number(trimmed);
+    if (!Number.isNaN(numeric)) {
+      return { endMs: numeric < 1e12 ? numeric * 1000 : numeric };
     }
-    if (typeof candidate === "string") {
-      const numeric = Number(candidate);
-      if (!Number.isNaN(numeric)) {
-        return numeric < 1e12 ? numeric * 1000 : numeric;
-      }
-      const parsed = Date.parse(candidate);
-      if (!Number.isNaN(parsed)) return parsed;
-    }
+    const normalized = normalizeIsoTimestamp(trimmed);
+    if (!normalized) return null;
+    const parsed = Date.parse(normalized);
+    if (Number.isNaN(parsed)) return null;
+    return { endMs: parsed, normalized };
   }
   return null;
+}
+
+// Market end fields are parsed from Gamma metadata (ISO string, unix seconds, or unix ms).
+function parseMarketEndMs(market: any, allowedKeys?: string[]): MarketEndParse {
+  if (!market) return { endMs: null, raw: {} };
+  const candidates: Array<{ key: string; value: unknown }> = [
+    { key: "endDateIso", value: market?.endDateIso },
+    { key: "end_date_iso", value: market?.end_date_iso },
+    { key: "endDate", value: market?.endDate },
+    { key: "end_date", value: market?.end_date },
+    { key: "closeTime", value: market?.closeTime },
+    { key: "close_time", value: market?.close_time },
+    { key: "closedTime", value: market?.closedTime },
+    { key: "closed_time", value: market?.closed_time },
+    { key: "close_timestamp", value: market?.close_timestamp },
+    { key: "closeTimestamp", value: market?.closeTimestamp },
+    { key: "resolution_time", value: market?.resolution_time },
+    { key: "resolutionTime", value: market?.resolutionTime },
+    { key: "resolve_time", value: market?.resolve_time },
+    { key: "resolveTime", value: market?.resolveTime },
+    { key: "end_time", value: market?.end_time },
+    { key: "endTime", value: market?.endTime },
+  ];
+
+  const raw: Record<string, unknown> = {};
+  for (const candidate of candidates) {
+    raw[candidate.key] = candidate.value;
+  }
+
+  const allowed = allowedKeys ? new Set(allowedKeys) : null;
+  for (const candidate of candidates) {
+    if (allowed && !allowed.has(candidate.key)) continue;
+    const parsed = parseMarketEndCandidate(candidate.value);
+    if (parsed) {
+      return {
+        endMs: parsed.endMs,
+        source: candidate.key,
+        normalized: parsed.normalized,
+        raw,
+      };
+    }
+  }
+  return { endMs: null, raw };
 }
 
 function getMissingTradeFields(trade: Trade): string[] {
@@ -678,11 +729,40 @@ export async function mirrorTrade(
         return { status: "skipped", reason: "market closed/inactive" };
       }
 
-      const endMs = parseMarketEndMs(market);
+      const gammaEnd = parseMarketEndMs(market, ["endDateIso", "end_date_iso", "endDate", "end_date"]);
+      let endMs = gammaEnd.endMs;
+      let endSource = gammaEnd.source ? `gamma:${gammaEnd.source}` : "gamma";
+      let endRaw = gammaEnd.raw;
+      let endNormalized = gammaEnd.normalized;
+
+      if (!endMs) {
+        try {
+          const clobMarket = await publicClient.getMarket(trade.conditionId);
+          const clobEnd = parseMarketEndMs(clobMarket);
+          if (clobEnd.endMs) {
+            endMs = clobEnd.endMs;
+            endSource = clobEnd.source ? `clob:${clobEnd.source}` : "clob";
+            endRaw = clobEnd.raw;
+            endNormalized = clobEnd.normalized;
+          }
+        } catch (err) {
+          const info = extractErrorInfo(err);
+          logger.debug("clob market lookup failed", {
+            conditionId: trade.conditionId,
+            tokenID: tokenId,
+            error: info.message,
+            status: info.status,
+          });
+        }
+      }
+
       if (!endMs) {
         logDecision("SKIP_MARKET_END_UNKNOWN", trade, {
           tokenID: tokenId,
           marketTitle,
+          marketEndSource: endSource,
+          marketEndRaw: endRaw,
+          marketEndNormalized: endNormalized,
           closed: isClosed,
           active: isActive,
           strict: strictMarket,
@@ -693,6 +773,20 @@ export async function mirrorTrade(
       const nowMs = Date.now();
       const safetyMs = config.marketEndSafetySeconds * 1000;
       if (nowMs >= endMs - safetyMs) {
+        const remainingMs = endMs - nowMs;
+        logger.debug("market expiry check", {
+          tokenID: tokenId,
+          conditionId: trade.conditionId,
+          marketTitle,
+          marketEndSource: endSource,
+          marketEndRaw: endRaw,
+          marketEndNormalized: endNormalized,
+          marketEndMs: endMs,
+          marketEndIso: new Date(endMs).toISOString(),
+          nowMs,
+          remainingMs,
+          marketEndSafetyMs: safetyMs,
+        });
         logExpiredDecision(trade, {
           tokenID: tokenId,
           marketTitle,
