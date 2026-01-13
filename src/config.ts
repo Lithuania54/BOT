@@ -6,16 +6,7 @@ import { logger } from "./logger";
 
 dotenv.config();
 
-const DEFAULT_TARGETS = [
-  "https://polymarket.com/@0xf247584e41117bbBe4Cc06E4d2C95741792a5216-1742469835200",
-  "https://polymarket.com/@BoshBashBish",
-  "https://polymarket.com/@distinct-baguette",
-  "https://polymarket.com/@rwo",
-  "https://polymarket.com/@SeriouslySirius",
-  "https://polymarket.com/@swisstony",
-  "https://polymarket.com/@LlamaEnjoyer",
-  "https://polymarket.com/@kch123",
-];
+const DEFAULT_TARGET_TRADER_WALLET = "0xf247584e41117bbbe4cc06e4d2c95741792a5216";
 
 export function normalizeEnvValue(raw: string | undefined): string | undefined {
   if (raw === undefined) return undefined;
@@ -39,6 +30,23 @@ function normalizeHex(raw: string | undefined): string | undefined {
   if (value === "") return "";
   if (value.startsWith("0x") || value.startsWith("0X")) return value;
   return `0x${value}`;
+}
+
+function normalizeWalletAddress(raw: string | undefined): string {
+  const value = normalizeHex(raw);
+  if (!value) {
+    throw new Error("COPY_TRADER_WALLET is required.");
+  }
+  const normalized = value.toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(normalized)) {
+    throw new Error(`COPY_TRADER_WALLET must be a valid 0x address: ${value}`);
+  }
+  return normalized;
+}
+
+function extractAddress(value: string): string | null {
+  const match = value.match(/0x[0-9a-fA-F]{40}/);
+  return match ? match[0].toLowerCase() : null;
 }
 
 function parseNumber(name: string, fallback?: number): number {
@@ -170,6 +178,13 @@ function validateConfig(config: Config) {
     parseUrlValue("RPC_URL", config.rpcUrl);
   }
 
+  if (config.targets.length !== 1) {
+    throw new Error("Only one source wallet is supported at this time.");
+  }
+  if (config.targets[0].toLowerCase() !== config.targetTraderWallet) {
+    throw new Error("TARGETS must match COPY_TRADER_WALLET.");
+  }
+
   if (!isAddress(config.myUserAddress)) {
     throw new Error(`MY_USER_ADDRESS must be a valid 0x address: ${config.myUserAddress}`);
   }
@@ -234,10 +249,31 @@ function validateConfig(config: Config) {
 }
 
 export function loadConfig(): Config {
+  const targetTraderWallet = normalizeWalletAddress(
+    env("COPY_TRADER_WALLET") || env("TARGET_TRADER_WALLET") || DEFAULT_TARGET_TRADER_WALLET
+  );
   const targetsRaw = env("TARGETS");
-  const targets = targetsRaw
+  const parsedTargets = targetsRaw
     ? targetsRaw.split(",").map((t) => normalizeEnvValue(t) || "").filter(Boolean)
-    : DEFAULT_TARGETS;
+    : [];
+  if (parsedTargets.length > 1) {
+    throw new Error("Only one TARGETS entry is supported. Use COPY_TRADER_WALLET for the single source wallet.");
+  }
+  if (parsedTargets.length === 1) {
+    const embedded = extractAddress(parsedTargets[0]);
+    if (embedded && embedded.toLowerCase() !== targetTraderWallet) {
+      throw new Error(
+        `TARGETS must reference the COPY_TRADER_WALLET (${targetTraderWallet}). Got ${parsedTargets[0]}`
+      );
+    }
+    if (!embedded) {
+      logger.warn("TARGETS provided without wallet address; using COPY_TRADER_WALLET instead.", {
+        target: parsedTargets[0],
+        copyTraderWallet: targetTraderWallet,
+      });
+    }
+  }
+  const targets = [targetTraderWallet];
 
   const followMode = (env("FOLLOW_MODE") || "LEADER").toUpperCase() as FollowMode;
   if (followMode !== "LEADER" && followMode !== "TOPK") {
@@ -248,6 +284,7 @@ export function loadConfig(): Config {
 
   const config: Config = {
     targets,
+    targetTraderWallet,
     followMode,
     topK: parseNumber("TOPK", 2),
     lookbackDays: parseNumber("LOOKBACK_DAYS", 30),

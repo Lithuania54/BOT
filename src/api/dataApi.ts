@@ -1,16 +1,11 @@
 import { fetchJson } from "./http";
 import { ClosedPosition, Position, Trade } from "../types";
+import { toMs } from "../utils/time";
 
 const DATA_API_BASE = "https://data-api.polymarket.com";
 
-function normalizeTimestamp(value: unknown): number {
-  if (value === null || value === undefined) return Date.now();
-  if (typeof value === "number") return value < 1e12 ? value * 1000 : value;
-  const str = String(value);
-  const numeric = Number(str);
-  if (!Number.isNaN(numeric)) return numeric < 1e12 ? numeric * 1000 : numeric;
-  const parsed = Date.parse(str);
-  return Number.isNaN(parsed) ? Date.now() : parsed;
+function normalizeTimestamp(value: unknown): number | null {
+  return toMs(value as any);
 }
 
 function asNumber(value: unknown, fallback = 0): number {
@@ -27,13 +22,17 @@ export function normalizeTrade(raw: any, proxyWallet: string): Trade | null {
   const priceRaw = String(raw?.price ?? raw?.avgPrice ?? raw?.rate ?? "0");
   const size = asNumber(sizeRaw);
   const price = asNumber(priceRaw);
-  const timestampMs = normalizeTimestamp(raw?.timestamp ?? raw?.time ?? raw?.createdAt ?? raw?.created_at);
+  const timestampRaw = raw?.timestamp ?? raw?.time ?? raw?.createdAt ?? raw?.created_at;
+  const timestampMs = normalizeTimestamp(timestampRaw);
   const transactionHash = String(raw?.transactionHash ?? raw?.transaction_hash ?? raw?.txHash ?? "");
 
-  if (!conditionId || !side || !transactionHash || !Number.isFinite(outcomeIndex)) {
+  if (!conditionId || !side || !Number.isFinite(outcomeIndex)) {
     return null;
   }
   if (!Number.isFinite(size) || !Number.isFinite(price)) {
+    return null;
+  }
+  if (timestampMs === null) {
     return null;
   }
 
@@ -48,6 +47,7 @@ export function normalizeTrade(raw: any, proxyWallet: string): Trade | null {
     sizeRaw,
     priceRaw,
     timestampMs,
+    timestampRaw: String(timestampRaw ?? ""),
   };
 }
 
@@ -103,6 +103,6 @@ export async function fetchClosedPositions(user: string): Promise<ClosedPosition
   return rows.map((row: any) => ({
     realizedPnl: asNumber(row?.realizedPnl ?? row?.realized_pnl ?? 0),
     totalBought: asNumber(row?.totalBought ?? row?.total_bought ?? 0),
-    timestampMs: normalizeTimestamp(row?.timestamp ?? row?.time ?? row?.createdAt ?? row?.created_at),
+    timestampMs: normalizeTimestamp(row?.timestamp ?? row?.time ?? row?.createdAt ?? row?.created_at) ?? 0,
   }));
 }

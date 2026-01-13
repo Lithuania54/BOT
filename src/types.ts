@@ -2,6 +2,7 @@ export type FollowMode = "LEADER" | "TOPK";
 
 export interface Config {
   targets: string[];
+  targetTraderWallet: string;
   followMode: FollowMode;
   topK: number;
   lookbackDays: number;
@@ -68,6 +69,7 @@ export interface Trade {
   sizeRaw: string;
   priceRaw: string;
   timestampMs: number;
+  timestampRaw?: string;
 }
 
 export interface Position {

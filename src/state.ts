@@ -1,6 +1,7 @@
 import Database from "better-sqlite3";
 import path from "path";
 import { OrderBookMeta, ResolvedTarget, TraderScore } from "./types";
+import { toMs } from "./utils/time";
 
 interface TargetRow {
   target: string;
@@ -170,7 +171,8 @@ export class StateStore {
       .prepare("SELECT proxyWallet, lastSeenMs FROM last_seen")
       .all() as LastSeenRow[];
     for (const row of lastSeenRows) {
-      this.lastSeenCache.set(row.proxyWallet, row.lastSeenMs);
+      const ts = toMs(row.lastSeenMs) ?? 0;
+      this.lastSeenCache.set(row.proxyWallet, ts);
     }
   }
 
@@ -214,10 +216,11 @@ export class StateStore {
   }
 
   setLastSeen(proxyWallet: string, lastSeenMs: number) {
-    this.lastSeenCache.set(proxyWallet, lastSeenMs);
+    const normalized = toMs(lastSeenMs) ?? 0;
+    this.lastSeenCache.set(proxyWallet, normalized);
     this.db
       .prepare("INSERT OR REPLACE INTO last_seen (proxyWallet, lastSeenMs) VALUES (?, ?)")
-      .run(proxyWallet, lastSeenMs);
+      .run(proxyWallet, normalized);
   }
 
   hasProcessed(tradeKey: string): boolean {
@@ -315,9 +318,11 @@ export class StateStore {
   }
 
   setLastTrade(tradeKey: string, timestampMs: number) {
+    const normalized = toMs(timestampMs);
+    if (normalized === null) return;
     this.db
       .prepare("INSERT OR REPLACE INTO last_trade (id, tradeKey, timestampMs) VALUES (1, ?, ?)")
-      .run(tradeKey, timestampMs);
+      .run(tradeKey, normalized);
   }
 
   getLastTrade(): { tradeKey?: string; timestampMs?: number } {
@@ -325,6 +330,7 @@ export class StateStore {
       .prepare("SELECT tradeKey, timestampMs FROM last_trade WHERE id = 1")
       .get() as LastCopiedRow | undefined;
     if (!row) return {};
-    return { tradeKey: row.tradeKey || undefined, timestampMs: row.timestampMs || undefined };
+    const normalized = toMs(row.timestampMs);
+    return { tradeKey: row.tradeKey || undefined, timestampMs: normalized || undefined };
   }
 }

@@ -62,6 +62,17 @@ async function fetchNewTradesForTarget(
       if (trade.timestampMs > lastSeen) {
         trades.push(trade);
         newestTimestamp = Math.max(newestTimestamp, trade.timestampMs);
+      } else {
+        logger.debug("trade skipped", {
+          reasonCode: "TRADE_TOO_OLD",
+          proxyWallet: trade.proxyWallet,
+          conditionId: trade.conditionId,
+          outcomeIndex: trade.outcomeIndex,
+          side: trade.side,
+          tradeTimestampRaw: trade.timestampRaw || null,
+          tradeTimestampMs: trade.timestampMs,
+          lastSeenMs: lastSeen,
+        });
       }
     }
     const oldest = raw[raw.length - 1];
@@ -77,6 +88,7 @@ async function fetchNewTradesForTarget(
 async function run() {
   const config = loadConfig();
   const state = new StateStore();
+  logger.info(`Copying trades ONLY from: ${config.targetTraderWallet}`);
   const cursorStore = new MirrorCursorStore(
     config.mirrorCursorFile,
     config.mirrorBootstrapLookbackMs,
@@ -140,7 +152,14 @@ async function run() {
     publicClient,
   });
 
-  const resolvedTargets = await resolveTargets(config.targets, state);
+  const resolvedTargetsAll = await resolveTargets(config.targets, state);
+  const targetWallet = config.targetTraderWallet.toLowerCase();
+  const resolvedTargets = resolvedTargetsAll.filter(
+    (target) => target.proxyWallet.toLowerCase() === targetWallet
+  );
+  if (resolvedTargets.length !== 1) {
+    throw new Error(`Resolved targets must contain exactly ${targetWallet}.`);
+  }
   for (const target of resolvedTargets) {
     cursorStore.ensureCursor(target.proxyWallet);
   }
@@ -187,6 +206,18 @@ async function run() {
             const { trades, newestTimestamp } = await fetchNewTradesForTarget(target, state, cursorMs);
             if (!trades.length) return;
             for (const trade of trades) {
+              if (trade.proxyWallet.toLowerCase() !== targetWallet) {
+                logger.warn("trade skipped", {
+                  reasonCode: "NOT_TARGET_WALLET",
+                  proxyWallet: trade.proxyWallet,
+                  conditionId: trade.conditionId,
+                  outcomeIndex: trade.outcomeIndex,
+                  side: trade.side,
+                  tradeTimestampRaw: trade.timestampRaw || null,
+                  tradeTimestampMs: trade.timestampMs,
+                });
+                continue;
+              }
               const { copy, weight } = shouldCopyTrade(selection, trade);
               if (!copy) continue;
               const keyResult = buildTradeKey(trade);
@@ -201,12 +232,36 @@ async function run() {
               }
 
               const key = keyResult.key;
-              if (inMemoryTradeKeys.has(key)) continue;
+              if (inMemoryTradeKeys.has(key)) {
+                logger.debug("trade skipped", {
+                  reasonCode: "DUPLICATE",
+                  proxyWallet: trade.proxyWallet,
+                  conditionId: trade.conditionId,
+                  outcomeIndex: trade.outcomeIndex,
+                  side: trade.side,
+                  tradeTimestampRaw: trade.timestampRaw || null,
+                  tradeTimestampMs: trade.timestampMs,
+                  key,
+                });
+                continue;
+              }
               inMemoryTradeKeys.add(key);
               if (inMemoryTradeKeys.size > 50000) {
                 inMemoryTradeKeys.clear();
               }
-              if (state.hasProcessed(key)) continue;
+              if (state.hasProcessed(key)) {
+                logger.debug("trade skipped", {
+                  reasonCode: "DUPLICATE",
+                  proxyWallet: trade.proxyWallet,
+                  conditionId: trade.conditionId,
+                  outcomeIndex: trade.outcomeIndex,
+                  side: trade.side,
+                  tradeTimestampRaw: trade.timestampRaw || null,
+                  tradeTimestampMs: trade.timestampMs,
+                  key,
+                });
+                continue;
+              }
 
               if (!tradingEnabled) {
                 skippedDueToDisabled += 1;

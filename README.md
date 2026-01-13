@@ -3,8 +3,13 @@
 ## Why the bot can stop buying
 - Preflight checks fail (auth, funder/signature mismatch, balance/allowance, or collateral reserved in open orders).
 - Market metadata is missing or indicates the market is closed/expired/too close to end.
+- Market end time is too soon (minimum 5 minutes remaining enforced).
 - Safety limits are hit (min size, daily cap, max per-trade size, or balance cooldown after failures).
 - Market filters skip disallowed categories (e.g., sports).
+
+## Single-wallet mode
+- The bot is currently locked to copy trades from a single source wallet.
+- Configure `COPY_TRADER_WALLET` (default `0xf247584e41117bbbe4cc06e4d2c95741792a5216`) and the runtime will enforce exactly one target.
 
 ## Allowance + market filter defaults
 - `AUTO_APPROVE=false`: disable automatic on-chain approvals by default (EOA only).
@@ -27,6 +32,9 @@
 - `SKIP_MARKET_CLOSED`: Gamma says closed/archived/inactive.
 - `SKIP_MARKET_END_UNKNOWN`: could not determine end time; BUY skipped for safety.
 - `SKIP_MARKET_EXPIRED`: end time is past or too close for safety window.
+- `NOT_TARGET_WALLET`: trade does not match `COPY_TRADER_WALLET`.
+- `TRADE_TOO_OLD`: trade timestamp is <= last seen cursor.
+- `DUPLICATE`: trade key already processed in-memory or persisted.
 - `SKIP_ORDER_TTL_CROSSES_END`: order TTL would extend past end time.
 - `SKIP_CATEGORY_SPORTS`: market is categorized/tagged as sports or matches sports patterns.
 - `SKIP_CATEGORY_NOT_ALLOWED`: category exists but is not in `ALLOWED_CATEGORIES`.

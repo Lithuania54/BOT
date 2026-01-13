@@ -1,5 +1,6 @@
 import { promises as fs } from "fs";
 import path from "path";
+import { toMs } from "./utils/time";
 
 type CursorFile = {
   version: number;
@@ -34,8 +35,8 @@ export class MirrorCursorStore {
       const parsed = JSON.parse(raw) as CursorFile;
       if (parsed?.cursors && typeof parsed.cursors === "object") {
         for (const [wallet, value] of Object.entries(parsed.cursors)) {
-          const ts = Number(value);
-          if (Number.isFinite(ts)) {
+          const ts = toMs(value as any);
+          if (ts !== null) {
             this.cursors.set(wallet, ts);
           }
         }
@@ -58,10 +59,11 @@ export class MirrorCursorStore {
   }
 
   updateCursor(proxyWallet: string, timestampMs: number) {
-    if (!Number.isFinite(timestampMs)) return;
+    const normalized = toMs(timestampMs) ?? null;
+    if (normalized === null) return;
     const current = this.cursors.get(proxyWallet) ?? this.baseTimestampMs;
-    if (timestampMs > current) {
-      this.cursors.set(proxyWallet, timestampMs);
+    if (normalized > current) {
+      this.cursors.set(proxyWallet, normalized);
       this.dirty = true;
     }
   }

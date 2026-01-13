@@ -19,10 +19,12 @@ import {
   formatUsdcMicro,
   parseUsdcToMicro,
 } from "./preflight";
+import { toMs } from "./utils/time";
 
 const DEBUG_LOG_LIMIT = 3;
 const ORDER_RETRY_DELAYS_MS = [1000, 2000, 4000];
 const AUTH_BACKOFF_MS = 60 * 1000;
+const MIN_TIME_TO_MARKET_END_MS = 5 * 60 * 1000;
 let debugLogged = 0;
 let balanceCooldownUntilMs = 0;
 let lastAuthOkMs = 0;
@@ -64,6 +66,8 @@ function logDecision(reasonCode: string, trade: Trade, extra?: Record<string, un
     conditionId: trade.conditionId,
     outcomeIndex: trade.outcomeIndex,
     side: trade.side,
+    tradeTimestampMs: trade.timestampMs,
+    tradeTimestampRaw: trade.timestampRaw || null,
     ...extra,
   });
 }
@@ -76,6 +80,8 @@ function logExpiredDecision(trade: Trade, extra?: Record<string, unknown>) {
     conditionId: trade.conditionId,
     outcomeIndex: trade.outcomeIndex,
     side: trade.side,
+    tradeTimestampMs: trade.timestampMs,
+    tradeTimestampRaw: trade.timestampRaw || null,
     ...extra,
   };
   if (expiredLogCache.has(key)) {
@@ -114,21 +120,27 @@ function normalizeIsoTimestamp(value: string): string | null {
 
 function parseMarketEndCandidate(value: unknown): { endMs: number; normalized?: string } | null {
   if (value === undefined || value === null) return null;
+  if (value instanceof Date) {
+    const ms = toMs(value);
+    return ms === null ? null : { endMs: ms };
+  }
   if (typeof value === "number" && Number.isFinite(value)) {
-    return { endMs: value < 1e12 ? value * 1000 : value };
+    const ms = toMs(value);
+    return ms === null ? null : { endMs: ms };
   }
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed) return null;
     const numeric = Number(trimmed);
     if (!Number.isNaN(numeric)) {
-      return { endMs: numeric < 1e12 ? numeric * 1000 : numeric };
+      const ms = toMs(numeric);
+      return ms === null ? null : { endMs: ms };
     }
     const normalized = normalizeIsoTimestamp(trimmed);
     if (!normalized) return null;
-    const parsed = Date.parse(normalized);
-    if (Number.isNaN(parsed)) return null;
-    return { endMs: parsed, normalized };
+    const ms = toMs(normalized);
+    if (ms === null) return null;
+    return { endMs: ms, normalized };
   }
   return null;
 }
@@ -179,7 +191,6 @@ function parseMarketEndMs(market: any, allowedKeys?: string[]): MarketEndParse {
 function getMissingTradeFields(trade: Trade): string[] {
   const missing: string[] = [];
   if (!trade.proxyWallet) missing.push("proxyWallet");
-  if (!trade.transactionHash) missing.push("transactionHash");
   if (!trade.conditionId) missing.push("conditionId");
   if (!Number.isFinite(trade.outcomeIndex)) missing.push("outcomeIndex");
   if (trade.side !== "BUY" && trade.side !== "SELL") missing.push("side");
@@ -324,6 +335,7 @@ function tradeSnippet(trade: Trade) {
     size: trade.size,
     price: trade.price,
     timestamp: trade.timestampMs,
+    timestampRaw: trade.timestampRaw || null,
   };
 }
 
@@ -615,7 +627,9 @@ export function buildTradeKey(trade: Trade): {
     };
   }
 
-  const key = `${trade.proxyWallet}:${trade.transactionHash}:${trade.conditionId}:${trade.outcomeIndex}:${trade.side}:${trade.size}:${trade.price}:${trade.timestampMs}`;
+  const key = trade.transactionHash
+    ? `${trade.proxyWallet}:${trade.transactionHash}:${trade.conditionId}:${trade.outcomeIndex}:${trade.side}:${trade.size}:${trade.price}:${trade.timestampMs}`
+    : `fallback:${trade.proxyWallet}:${trade.conditionId}:${trade.outcomeIndex}:${trade.side}:${trade.price}:${trade.size}:${trade.timestampMs}`;
   return { key };
 }
 
@@ -656,6 +670,12 @@ export async function mirrorTrade(
       snippet: tradeSnippet(trade),
     });
     return { status: "skipped", reason: "missing required trade fields" };
+  }
+  if (trade.proxyWallet.toLowerCase() !== config.targetTraderWallet) {
+    logDecision("NOT_TARGET_WALLET", trade, {
+      expectedWallet: config.targetTraderWallet,
+    });
+    return { status: "skipped", reason: "not target wallet" };
   }
 
   const tokenIds = await getClobTokenIdsForCondition(trade.conditionId, state);
@@ -772,9 +792,12 @@ export async function mirrorTrade(
 
       const nowMs = Date.now();
       const safetyMs = config.marketEndSafetySeconds * 1000;
-      if (nowMs >= endMs - safetyMs) {
-        const remainingMs = endMs - nowMs;
+      const msRemaining = endMs - nowMs;
+      const minRemainingMs = Math.max(MIN_TIME_TO_MARKET_END_MS, safetyMs);
+      if (msRemaining < minRemainingMs) {
+        const minutesRemaining = msRemaining / (60 * 1000);
         logger.debug("market expiry check", {
+          proxyWallet: trade.proxyWallet,
           tokenID: tokenId,
           conditionId: trade.conditionId,
           marketTitle,
@@ -783,8 +806,12 @@ export async function mirrorTrade(
           marketEndNormalized: endNormalized,
           marketEndMs: endMs,
           marketEndIso: new Date(endMs).toISOString(),
+          tradeTimestampRaw: trade.timestampRaw || null,
+          tradeTimestampMs: trade.timestampMs,
           nowMs,
-          remainingMs,
+          msRemaining,
+          minutesRemaining,
+          minRemainingMs,
           marketEndSafetyMs: safetyMs,
         });
         logExpiredDecision(trade, {
@@ -792,7 +819,13 @@ export async function mirrorTrade(
           marketTitle,
           nowMs,
           marketEndMs: endMs,
-          safetyMs,
+          msRemaining,
+          minutesRemaining,
+          minRemainingMs,
+          marketEndSafetyMs: safetyMs,
+          marketEndSource: endSource,
+          marketEndRaw: endRaw,
+          marketEndNormalized: endNormalized,
         });
         return { status: "skipped", reason: "market expired/too close to end" };
       }
