@@ -34,6 +34,7 @@ let lastPreflightSnapshot:
       at: number;
     }
   | null = null;
+const expiredLogCache = new Set<string>();
 
 function todayKey(): string {
   const now = new Date();
@@ -63,6 +64,24 @@ function logDecision(reasonCode: string, trade: Trade, extra?: Record<string, un
     side: trade.side,
     ...extra,
   });
+}
+
+function logExpiredDecision(trade: Trade, extra?: Record<string, unknown>) {
+  const key = `${trade.conditionId}:${trade.outcomeIndex}:${trade.side}`;
+  const payload = {
+    reasonCode: "SKIP_MARKET_EXPIRED",
+    proxyWallet: trade.proxyWallet,
+    conditionId: trade.conditionId,
+    outcomeIndex: trade.outcomeIndex,
+    side: trade.side,
+    ...extra,
+  };
+  if (expiredLogCache.has(key)) {
+    logger.debug("trade skipped", payload);
+    return;
+  }
+  expiredLogCache.add(key);
+  logger.warn("trade skipped", payload);
 }
 
 // Market end fields are parsed from Gamma metadata (ISO string, unix seconds, or unix ms).
@@ -115,6 +134,13 @@ function getMissingTradeFields(trade: Trade): string[] {
   if (!Number.isFinite(trade.price)) missing.push("price");
   if (!Number.isFinite(trade.timestampMs)) missing.push("timestamp");
   return missing;
+}
+
+function getPositionsUserAddress(config: Config): string {
+  if (config.signatureType === 1 || config.signatureType === 2) {
+    return config.funderAddress || config.myUserAddress;
+  }
+  return config.myUserAddress;
 }
 
 function isBalanceCooldownActive(config: Config): boolean {
@@ -333,15 +359,6 @@ async function tradingPreflight(
         authOk: true,
         reasonCode: "SKIP_INVALID_FUNDER",
         reason: "funder address missing or invalid for proxy signatures",
-        context: baseContext,
-      };
-    }
-    if (config.myUserAddress && funderAddress && config.myUserAddress.toLowerCase() !== funderAddress.toLowerCase()) {
-      return {
-        ok: false,
-        authOk: true,
-        reasonCode: "SKIP_FUNDER_MISMATCH",
-        reason: "funder address does not match MY_USER_ADDRESS",
         context: baseContext,
       };
     }
@@ -654,7 +671,7 @@ export async function mirrorTrade(
       const nowMs = Date.now();
       const safetyMs = config.marketEndSafetySeconds * 1000;
       if (nowMs >= endMs - safetyMs) {
-        logDecision("SKIP_MARKET_EXPIRED", trade, {
+        logExpiredDecision(trade, {
           tokenID: tokenId,
           marketTitle,
           nowMs,
@@ -745,7 +762,7 @@ export async function mirrorTrade(
     });
     return { status: "skipped", reason: "non-positive desired notional" };
   }
-  if (config.maxDailyUsdc !== undefined) {
+  if (Number.isFinite(config.maxDailyUsdc)) {
     const dateKey = todayKey();
     const spent = state.getDailyNotional(dateKey);
     if (spent + desiredNotional > config.maxDailyUsdc) {
@@ -763,7 +780,8 @@ export async function mirrorTrade(
   shares = Math.min(shares, config.maxSharesPerTrade);
 
   if (trade.side === "SELL") {
-    const positions = await fetchPositions(config.myUserAddress, trade.conditionId);
+    const positionsUser = getPositionsUserAddress(config);
+    const positions = await fetchPositions(positionsUser, trade.conditionId);
     const position = positions.find(
       (row) => row.conditionId === trade.conditionId && row.outcomeIndex === trade.outcomeIndex
     );
@@ -797,7 +815,7 @@ export async function mirrorTrade(
   }
 
   const notional = shares * limitPrice;
-  if (config.maxDailyUsdc !== undefined) {
+  if (Number.isFinite(config.maxDailyUsdc)) {
     const dateKey = todayKey();
     const spent = state.getDailyNotional(dateKey);
     if (spent + notional > config.maxDailyUsdc) {

@@ -1,4 +1,7 @@
 import { ApiKeyCreds, ClobClient, Side } from "@polymarket/clob-client";
+import { randomBytes } from "crypto";
+import { promises as fs } from "fs";
+import path from "path";
 import { Wallet } from "@ethersproject/wallet";
 import { Config, OrderBookMeta } from "./types";
 import { StateStore } from "./state";
@@ -7,6 +10,10 @@ import { logger } from "./logger";
 const META_TTL_MS = 5 * 60 * 1000;
 const API_KEY_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000];
 const API_KEY_BACKGROUND_RETRY_MS = 2 * 60 * 1000;
+const API_KEY_CREDS_PERMS = 0o600;
+
+type ApiKeySource = "env" | "file" | "created";
+type ApiKeyResult = { creds: ApiKeyCreds; source: ApiKeySource };
 
 function resolveFunderAddress(config: Config): string | undefined {
   if (config.signatureType === 1 || config.signatureType === 2) {
@@ -19,6 +26,7 @@ export async function initClobClients(config: Config): Promise<{
   publicClient: ClobClient;
   tradingClient?: ClobClient;
   startTradingClientRetry?: (onReady: (client: ClobClient) => void) => void;
+  apiKeySource?: ApiKeySource;
 }> {
   const publicClient = new ClobClient(config.clobHost, config.chainId);
 
@@ -27,22 +35,24 @@ export async function initClobClients(config: Config): Promise<{
   }
 
   const signer = new Wallet(config.privateKey as string);
-  const creds = await createOrDeriveApiKeyWithRetry(config, signer);
+  const apiKeyResult = await createOrDeriveApiKeyWithRetry(config, signer);
   let tradingClient: ClobClient | undefined;
-  if (creds) {
-    const funderAddress = resolveFunderAddress(config);
-    tradingClient = new ClobClient(
-      config.clobHost,
-      config.chainId,
-      signer,
-      creds,
-      config.signatureType as any,
-      funderAddress
-    );
-  } else {
-    logger.error("API key creation failed; bot will run in observe-only mode and retry in background");
-    logger.warn("If this error is intermittent, ensure system time is synced.");
-  }
+  const funderAddress = resolveFunderAddress(config);
+  tradingClient = new ClobClient(
+    config.clobHost,
+    config.chainId,
+    signer,
+    apiKeyResult.creds,
+    config.signatureType as any,
+    funderAddress
+  );
+  const signerAddress = await signer.getAddress();
+  logger.info("identity summary", {
+    derivedSignerAddress: signerAddress,
+    signatureType: config.signatureType,
+    funderAddress,
+    apiKeySource: apiKeyResult.source,
+  });
 
   const startTradingClientRetry = tradingClient
     ? undefined
@@ -53,20 +63,18 @@ export async function initClobClients(config: Config): Promise<{
           running = true;
           try {
             const nextCreds = await createOrDeriveApiKeyWithRetry(config, signer);
-            if (nextCreds) {
-              const funderAddress = resolveFunderAddress(config);
-              const nextClient = new ClobClient(
-                config.clobHost,
-                config.chainId,
-                signer,
-                nextCreds,
-                config.signatureType as any,
-                funderAddress
-              );
-              onReady(nextClient);
-              logger.info("API key creation recovered; trading client authenticated");
-              clearInterval(timer);
-            }
+            const funderAddress = resolveFunderAddress(config);
+            const nextClient = new ClobClient(
+              config.clobHost,
+              config.chainId,
+              signer,
+              nextCreds.creds,
+              config.signatureType as any,
+              funderAddress
+            );
+            onReady(nextClient);
+            logger.info("API key creation recovered; trading client authenticated");
+            clearInterval(timer);
           } finally {
             running = false;
           }
@@ -81,7 +89,7 @@ export async function initClobClients(config: Config): Promise<{
         );
       };
 
-  return { publicClient, tradingClient, startTradingClientRetry };
+  return { publicClient, tradingClient, startTradingClientRetry, apiKeySource: apiKeyResult.source };
 }
 
 function sleep(ms: number): Promise<void> {
@@ -102,7 +110,53 @@ function readApiKeyCredsFromEnv(config: Config): ApiKeyCreds | null {
   return null;
 }
 
-async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
+async function readApiKeyCredsFromFile(filePath: string): Promise<ApiKeyCreds | null> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed?.key && parsed?.secret && parsed?.passphrase) {
+      return {
+        key: String(parsed.key),
+        secret: String(parsed.secret),
+        passphrase: String(parsed.passphrase),
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+async function writeApiKeyCredsToFile(filePath: string, creds: ApiKeyCreds): Promise<void> {
+  const resolved = path.resolve(filePath);
+  await fs.mkdir(path.dirname(resolved), { recursive: true });
+  await fs.writeFile(resolved, JSON.stringify({ ...creds, savedAt: new Date().toISOString() }, null, 2), {
+    encoding: "utf8",
+    mode: API_KEY_CREDS_PERMS,
+  });
+}
+
+async function loadOrCreateNonce(filePath: string): Promise<number> {
+  const resolved = path.resolve(filePath);
+  try {
+    const raw = await fs.readFile(resolved, "utf8");
+    const parsed = JSON.parse(raw);
+    const nonce = Number(parsed?.nonce);
+    if (Number.isFinite(nonce)) return nonce;
+  } catch {
+    // ignore and generate
+  }
+  const buffer = randomBytes(4);
+  const nonce = buffer.readUInt32BE(0);
+  await fs.mkdir(path.dirname(resolved), { recursive: true });
+  await fs.writeFile(resolved, JSON.stringify({ nonce, createdAt: new Date().toISOString() }, null, 2), {
+    encoding: "utf8",
+    mode: API_KEY_CREDS_PERMS,
+  });
+  return nonce;
+}
+
+async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet): Promise<ApiKeyResult> {
   const envCreds = readApiKeyCredsFromEnv(config);
   if (envCreds && !config.forceDeriveApiKey) {
     logger.info("Using API key credentials from environment variables.", {
@@ -110,7 +164,20 @@ async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
       funderAddress: config.funderAddress,
       signatureType: config.signatureType,
     });
-    return envCreds;
+    return { creds: envCreds, source: "env" };
+  }
+
+  if (!config.forceDeriveApiKey) {
+    const fileCreds = await readApiKeyCredsFromFile(config.apiKeyFile);
+    if (fileCreds) {
+      logger.info("Using API key credentials from file.", {
+        file: config.apiKeyFile,
+        myUserAddress: config.myUserAddress,
+        funderAddress: config.funderAddress,
+        signatureType: config.signatureType,
+      });
+      return { creds: fileCreds, source: "file" };
+    }
   }
 
   logger.info("Deriving API key", {
@@ -130,12 +197,19 @@ async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
     funderAddress
   );
   let lastError: unknown;
+  const nonce = await loadOrCreateNonce(config.apiKeyNonceFile);
   for (let attempt = 0; attempt < API_KEY_RETRY_DELAYS_MS.length + 1; attempt += 1) {
     try {
-      return await client.createOrDeriveApiKey();
+      const creds = await client.createOrDeriveApiKey(nonce);
+      await writeApiKeyCredsToFile(config.apiKeyFile, creds);
+      return { creds, source: "created" };
     } catch (err) {
       lastError = err;
       const info = extractErrorInfo(err);
+      logger.debug("createOrDeriveApiKey response", {
+        status: info.status,
+        response: info.body,
+      });
       logger.error("createOrDeriveApiKey failed", {
         status: info.status,
         error: info.message,
@@ -154,7 +228,7 @@ async function createOrDeriveApiKeyWithRetry(config: Config, signer: Wallet) {
   logger.error("createOrDeriveApiKey failed after retries", {
     error: extractErrorInfo(lastError).message,
   });
-  return null;
+  throw new Error("API key creation failed; check POLY_ADDRESS/signer and FUNDER_ADDRESS settings.");
 }
 
 function toNumber(value: unknown): number {

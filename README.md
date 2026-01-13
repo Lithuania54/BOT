@@ -5,6 +5,12 @@
 - Market metadata is missing or indicates the market is closed/expired/too close to end.
 - Safety limits are hit (min size, daily cap, max per-trade size, or balance cooldown after failures).
 
+## Trade cursor persistence
+- The bot persists the newest seen leader trade timestamp per proxy wallet to `MIRROR_CURSOR_FILE` (default `.pm_mirror_cursor.json`) to avoid replaying historical trades after restarts.
+- On first run without a cursor file, the cursor is set to `now - MIRROR_BOOTSTRAP_LOOKBACK_MS` (default 60000).
+- Set `START_FROM_NOW=true` to ignore any existing cursor and start fresh from “now”.
+- To replay from scratch, stop the bot and delete `.pm_mirror_cursor.json`.
+
 ## How to interpret reason codes
 - `SKIP_MISSING_REQUIRED_FIELDS`: trade row is missing required fields.
 - `SKIP_INVALID_TOKEN_ID`: tokenID resolution looks wrong (conditionId-like or address).

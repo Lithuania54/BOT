@@ -7,7 +7,8 @@
     "start": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test:config": "tsx scripts/config-parse-test.ts"
+    "test:config": "tsx scripts/config-parse-test.ts",
+    "show:approval": "tsx scripts/show-approval.ts"
   },
   "dependencies": {
     "@polymarket/clob-client": "^4.22.8",

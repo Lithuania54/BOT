@@ -2,18 +2,25 @@
 
 ## If bot won't trade
 - Check startup validation errors:
-  - `MY_USER_ADDRESS (...) must match signer address (...) for SIGNATURE_TYPE=0`
+  - `MY_USER_ADDRESS (...) must match the signer EOA derived from PRIVATE_KEY (...)`
+  - `FUNDER_ADDRESS is required for SIGNATURE_TYPE=0 and must match the signer EOA address`
   - `FUNDER_ADDRESS (...) must be different from signer address (...) for proxy/safe wallets`
-  - `MY_USER_ADDRESS (...) must match FUNDER_ADDRESS (...) for proxy/safe wallets`
+  - `FUNDER_ADDRESS is required for SIGNATURE_TYPE=1 or 2`
   - `PRIVATE_KEY must be a 32-byte hex string`
   - `CLOB_HOST is invalid` / `RPC_URL is invalid`
+- Confirm identity summary:
+  - Log line: `identity summary` shows `derivedSignerAddress`, `signatureType`, `funderAddress`, and `apiKeySource`.
 - Confirm selection is producing leaders:
   - Log line: `selection updated` with `reason` (e.g. `no-eligible-leader`, `min-hold-not-satisfied`, `stop-score-triggered`, `cooldown-active`, `topk-insufficient`)
   - If `sample size insufficient`, see `trader ineligible` logs.
 - Inspect skip reasons on trades:
   - Log line: `trade skipped` with `reasonCode` (e.g. `SKIP_MARKET_EXPIRED`, `SKIP_MIN_SIZE`, `SKIP_DAILY_CAP`, `SKIP_ALLOWANCE_LOW`).
 - Verify collateral status:
-  - Log line: `balance smoke check` shows `balance` and `allowance`.
+  - Log line: `allowance check` shows `balance`, `allowance`, `allowanceToken`, and `allowanceSpender`.
+  - `USDC allowance too low; approval required before trading` means the bot is in trading-disabled mode until approval.
+  - `USDC allowance sufficient; trading re-enabled` indicates trading resumes automatically.
+  - `AUTO_APPROVE disabled for proxy wallets...` indicates approval must be done in the Polymarket UI.
+  - `npm run show:approval` prints funder/token/spender/allowance with a reminder about proxy approvals.
   - If you see `SKIP_RESERVED_OPEN_ORDERS`, cancel open BUY orders to free collateral.
 - Look for promoted error logs:
   - `order failed: invalid signature`
@@ -22,3 +29,8 @@
   - `order failed: order expired`
 - Liveness watchdog:
   - `liveness watchdog: signals received but no successful order` indicates orders are failing or blocked; check recent `trade skipped` and `order failed` logs immediately before it.
+- Cursor persistence (avoid replaying expired trades after restart):
+  - Cursor file: `MIRROR_CURSOR_FILE` (default `.pm_mirror_cursor.json`) stores the newest seen trade timestamp per proxy wallet.
+  - First run seeds cursor to `now - MIRROR_BOOTSTRAP_LOOKBACK_MS` (default 60000).
+  - `START_FROM_NOW=true` ignores existing cursor and starts fresh.
+  - To replay from scratch, stop the bot and delete `.pm_mirror_cursor.json`.

@@ -148,29 +148,33 @@ function validateConfig(config: Config) {
     const signerAddress = signer.address.toLowerCase();
     const myUserAddress = config.myUserAddress.toLowerCase();
 
+    if (myUserAddress !== signerAddress) {
+      throw new Error(
+        `MY_USER_ADDRESS (${config.myUserAddress}) must match the signer EOA derived from PRIVATE_KEY (${signer.address}). ` +
+          "Set MY_USER_ADDRESS to your wallet address; set FUNDER_ADDRESS to your Polymarket proxy wallet if using SIGNATURE_TYPE=1 or 2."
+      );
+    }
+
     if (config.signatureType === 0) {
-      if (myUserAddress !== signerAddress) {
+      if (!config.funderAddress) {
         throw new Error(
-          `MY_USER_ADDRESS (${config.myUserAddress}) must match signer address (${signer.address}) for SIGNATURE_TYPE=0.`
+          "FUNDER_ADDRESS is required for SIGNATURE_TYPE=0 and must match the signer EOA address."
         );
       }
-      if (config.funderAddress && config.funderAddress.toLowerCase() !== signerAddress) {
+      if (config.funderAddress.toLowerCase() !== signerAddress) {
         throw new Error(
           `FUNDER_ADDRESS (${config.funderAddress}) must match signer address (${signer.address}) for SIGNATURE_TYPE=0.`
         );
       }
     } else {
       if (!config.funderAddress) {
-        throw new Error("FUNDER_ADDRESS is required for SIGNATURE_TYPE=1 or 2.");
+        throw new Error(
+          "FUNDER_ADDRESS is required for SIGNATURE_TYPE=1 or 2. Use the proxy wallet address shown on polymarket.com."
+        );
       }
       if (config.funderAddress.toLowerCase() === signerAddress) {
         throw new Error(
           `FUNDER_ADDRESS (${config.funderAddress}) must be different from signer address (${signer.address}) for proxy/safe wallets.`
-        );
-      }
-      if (config.funderAddress.toLowerCase() !== myUserAddress) {
-        throw new Error(
-          `MY_USER_ADDRESS (${config.myUserAddress}) must match FUNDER_ADDRESS (${config.funderAddress}) for proxy/safe wallets.`
         );
       }
     }
@@ -226,14 +230,21 @@ export function loadConfig(): Config {
     marketEndSafetySeconds: parseNumber("MARKET_END_SAFETY_SECONDS", 120),
     balanceErrorCooldownMs: parseNumber("BALANCE_ERROR_COOLDOWN_MS", 900000),
     noOrderLivenessMs: parseNumber("NO_ORDER_LIVENESS_MS", 900000),
+    autoApprove: parseBoolean("AUTO_APPROVE", false),
+    allowanceThresholdUsdc: parseNumber("ALLOWANCE_THRESHOLD_USDC", 0),
     autoRedeemEnabled: parseBoolean("AUTO_REDEEM_ENABLED", false),
     redeemPollMs: parseNumber("REDEEM_POLL_MS", 300000),
     redeemCooldownMs: parseNumber("REDEEM_COOLDOWN_MS", 3600000),
+    mirrorCursorFile: env("MIRROR_CURSOR_FILE") || ".pm_mirror_cursor.json",
+    mirrorBootstrapLookbackMs: parseNumber("MIRROR_BOOTSTRAP_LOOKBACK_MS", 60000),
+    startFromNow: parseBoolean("START_FROM_NOW", false),
     rpcUrl: parseRpcUrl(),
     polyApiKey: env("POLY_API_KEY"),
     polyApiSecret: env("POLY_API_SECRET"),
     polyApiPassphrase: env("POLY_API_PASSPHRASE"),
     forceDeriveApiKey: parseBoolean("FORCE_DERIVE_API_KEY", false),
+    apiKeyNonceFile: env("API_KEY_NONCE_FILE") || ".pm_api_nonce.json",
+    apiKeyFile: env("POLY_API_KEY_FILE") || ".pm_api_creds.json",
   };
 
   if (!config.dryRun && !config.funderAddress) {

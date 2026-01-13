@@ -24,21 +24,28 @@ export interface Config {
   myUserAddress: string;
   signatureType: number;
   funderAddress?: string;
-  maxDailyUsdc?: number;
+  maxDailyUsdc: number;
   openPnlPenaltyFactor: number;
   orderTtlSeconds: number;
   expirationSafetySeconds: number;
   marketEndSafetySeconds: number;
   balanceErrorCooldownMs: number;
   noOrderLivenessMs: number;
+  autoApprove: boolean;
+  allowanceThresholdUsdc: number;
   autoRedeemEnabled: boolean;
   redeemPollMs: number;
   redeemCooldownMs: number;
+  mirrorCursorFile: string;
+  mirrorBootstrapLookbackMs: number;
+  startFromNow: boolean;
   rpcUrl?: string;
   polyApiKey?: string;
   polyApiSecret?: string;
   polyApiPassphrase?: string;
   forceDeriveApiKey: boolean;
+  apiKeyNonceFile: string;
+  apiKeyFile: string;
 }
 
 export interface ResolvedTarget {
